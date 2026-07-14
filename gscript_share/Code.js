@@ -10,7 +10,7 @@
  */
 
 // מזהה תיקיית ההפצה בדרייב (מוזרק אוטומטית בעת הפריסה):
-var FOLDER_ID = '__FOLDER_ID__';
+var FOLDER_ID = '1SbJQ_MoifmNxTyKjz5A6rX8IwMnhtfMx';
 var SUBJECT_KEYWORD = 'מודל';
 var PROCESSED_LABEL = 'שיתוף-מודל-טופל';
 
