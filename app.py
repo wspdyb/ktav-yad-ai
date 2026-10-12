@@ -960,6 +960,15 @@ HTML = r"""<!DOCTYPE html>
  .mini:hover{background:#d6dcea}
  .mini.sugg{background:#fdf3d0;font-size:14px}
  .mini.sugg:hover{background:#f8e6a0}
+ #appDialog{position:fixed;inset:0;z-index:10000;display:none;align-items:center;justify-content:center;padding:20px;background:rgba(12,20,39,.52)}
+ #appDialog.open{display:flex}
+ #appDialogPanel{width:min(540px,100%);max-height:min(80vh,680px);overflow:auto;background:#fff;border:1px solid #dbe1ec;border-radius:16px;box-shadow:0 18px 60px rgba(10,20,40,.28);padding:24px}
+ #appDialogTitle{margin:0 0 12px;color:var(--navy);font-size:19px}
+ #appDialogMessage{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.6;color:#344058}
+ #appDialogInput{display:none;width:100%;margin-top:16px}
+ #appDialogActions{display:flex;gap:10px;justify-content:flex-start;margin-top:22px}
+ #appDialogActions button{min-width:92px}
+ @media(max-width:600px){#appDialogPanel{padding:18px}#appDialogActions button{flex:1}}
  @media(max-width:820px){.grid2{grid-template-columns:1fr}.line img{max-width:230px}}
 </style></head><body>
 <header>
@@ -1250,7 +1259,56 @@ HTML = r"""<!DOCTYPE html>
 </div>
 
 </main>
+<div id="appDialog" role="presentation">
+ <section id="appDialogPanel" role="dialog" aria-modal="true" aria-labelledby="appDialogTitle"
+  aria-describedby="appDialogMessage">
+  <h2 id="appDialogTitle">כתב-יד AI</h2>
+  <p id="appDialogMessage"></p>
+  <input id="appDialogInput" type="text">
+  <div id="appDialogActions">
+   <button id="appDialogCancel" class="btn teal" type="button">ביטול</button>
+   <button id="appDialogAccept" class="btn" type="button">אישור</button>
+  </div>
+ </section>
+</div>
 <script>
+let appDialogQueue=Promise.resolve();
+function showAppDialog(message,{title='כתב-יד AI',confirm=false,input=null,initialValue=''}={}){
+ const openDialog=()=>new Promise(resolve=>{
+  const overlay=document.getElementById('appDialog'),inputEl=document.getElementById('appDialogInput');
+  const cancel=document.getElementById('appDialogCancel'),accept=document.getElementById('appDialogAccept');
+  document.getElementById('appDialogTitle').textContent=title;
+  document.getElementById('appDialogMessage').textContent=message;
+  inputEl.style.display=input===null?'none':'block';
+  inputEl.value=initialValue;
+  inputEl.placeholder=input||'';
+  cancel.style.display=confirm||input!==null?'inline-block':'none';
+  accept.textContent=input!==null?'שמירה':'אישור';
+  overlay.classList.add('open');
+  const finish=value=>{
+   overlay.classList.remove('open');
+   cancel.onclick=null;accept.onclick=null;overlay.onclick=null;
+   document.removeEventListener('keydown',onKeyDown);
+   resolve(value);
+  };
+  const onKeyDown=event=>{
+   if(event.key==='Escape'&&(confirm||input!==null)){event.preventDefault();finish(input!==null?null:false);}
+   else if(event.key==='Enter'&&input!==null){event.preventDefault();finish(inputEl.value);}
+  };
+  cancel.onclick=()=>finish(input!==null?null:false);
+  accept.onclick=()=>finish(input!==null?inputEl.value:true);
+  overlay.onclick=event=>{if(event.target===overlay&&!confirm&&input===null)finish(true);};
+  document.addEventListener('keydown',onKeyDown);
+  requestAnimationFrame(()=>input!==null?inputEl.focus():accept.focus());
+ });
+ const queued=appDialogQueue.then(openDialog,openDialog);
+ appDialogQueue=queued.then(()=>undefined,()=>undefined);
+ return queued;
+}
+function appAlert(message,title){return showAppDialog(String(message),{title:title||'כתב-יד AI'});}
+function appConfirm(message,title){return showAppDialog(String(message),{title:title||'אישור נדרש',confirm:true});}
+function appPrompt(message,initialValue='',title){return showAppDialog(String(message),{
+ title:title||'עריכת ערך',confirm:true,input:'הקלד ערך',initialValue});}
 let lastLines={lines:[],parLines:[]};
 let chosenFiles=[];
 async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET',
@@ -1273,9 +1331,12 @@ function addFiles(fl){for(const f of fl)chosenFiles.push(f);
   chosenFiles.length?('נבחרו '+chosenFiles.length+' קבצים: '+chosenFiles.map(f=>f.name).join(', ')):'';}
 function readAsB64(f){return new Promise(res=>{const r=new FileReader();
  r.onload=()=>res(r.result.split(',')[1]);r.readAsDataURL(f);});}
-function readFile(id){return new Promise((res,rej)=>{const f=document.getElementById(id).files[0];
- if(!f){alert('בחר קובץ');rej();return;}const r=new FileReader();
- r.onload=()=>res(r.result.split(',')[1]);r.readAsDataURL(f);});}
+async function readFile(id){const f=document.getElementById(id).files[0];
+ if(!f){await appAlert('בחר קובץ');return null;}
+ return new Promise((res,rej)=>{const r=new FileReader();
+  r.onload=()=>res(r.result.split(',')[1]);
+  r.onerror=()=>rej(new Error('לא ניתן לקרוא את הקובץ שנבחר'));
+  r.readAsDataURL(f);});}
 
 /* ---------- שורות + ניווט מקלדת ---------- */
 function autoGrow(el){el.style.height='auto';el.style.height=Math.max(24,el.scrollHeight)+'px';}
@@ -1325,7 +1386,7 @@ function appendLines(divId,arr,offset){const div=document.getElementById(divId);
   const mrg=document.createElement('button');mrg.className='mini';mrg.textContent='⤴';
   mrg.title='מזג את הטקסט לשורה הקודמת';
   mrg.onclick=()=>{const prev=document.querySelector('#'+divId+' textarea.lt[data-i="'+(i-1)+'"]');
-   if(!prev){alert('אין שורה קודמת');return;}
+   if(!prev){appAlert('אין שורה קודמת');return;}
    prev.value=(prev.value.trim()+' '+inp.value.trim()).trim();autoGrow(prev);
    const it=lastLines[divId][i-1];if(it)it.text=prev.value;
    inp.value='';l.text='';row.style.display='none';
@@ -1407,7 +1468,7 @@ async function aiCorrect(){
    ? visible.filter(x=>pages.slice(0,amount).includes(x.pageKey))
    : visible.slice(0,amount);
  if(!selected.length){
-  alert(allVisible.some(x=>!x.aiCrop)
+  await appAlert(allVisible.some(x=>!x.aiCrop)
    ? 'כדי לשלוח חיתוכי שורות ל-AI, סמן "עמודים מלאים (פילוח אוטומטי לשורות)" ותמלל מחדש.'
    : scope==='manual'?'סמן לפחות שורה אחת לשליחה לתיקון AI.':'אין שורות גלויות לשליחה לתיקון');
   return;
@@ -1425,7 +1486,7 @@ async function aiCorrect(){
   renderAIReview(r.keys_used||[],r.metrics||{},r.warning||'');
   msg.textContent=`התקבלו ${aiCorrections.length} הצעות. הן עדיין טיוטה ולא נשמרו.`+
    (r.warning?' '+r.warning:'');
- }catch(e){msg.textContent='';alert('תיקון AI נכשל: '+e.message);}
+ }catch(e){msg.textContent='';await appAlert('תיקון AI נכשל: '+e.message,'תיקון AI נכשל');}
  finally{btn.disabled=false;}}
 function renderAIReview(keys,metrics,warning){
  const panel=document.getElementById('aiReview'),list=document.getElementById('aiReviewList');
@@ -1594,15 +1655,15 @@ async function addAIKey(){const name=document.getElementById('aiKeyName').value.
  msg.textContent='המפתח נשמר בהצפנה במחשב. לחץ על „בדוק חיבור” כדי לבדוק אותו מול Google.';
  await loadAIKeys();
  }catch(e){msg.textContent='לא ניתן לשמור את המפתח: '+e.message;}}
-async function removeAIKey(id){if(!confirm('להסיר את מפתח ה-API הזה?'))return;
+async function removeAIKey(id){if(!await appConfirm('להסיר את מפתח ה-API הזה?'))return;
  try{const r=await api('/api/ai_keys/remove',{id:id});
  if(r.error)throw Error(r.error);
- await loadAIKeys();}catch(e){alert('לא ניתן להסיר את המפתח: '+e.message);}}
+ await loadAIKeys();}catch(e){await appAlert('לא ניתן להסיר את המפתח: '+e.message,'הסרת מפתח נכשלה');}}
 
 /* ---------- תמלול חי ---------- */
 function setUploadLock(on){document.getElementById('drop').classList.toggle('disabled',on);
  document.getElementById('btnGo').disabled=on;}
-async function transcribe(){if(!chosenFiles.length){alert('בחר קבצים קודם');return;}
+async function transcribe(){if(!chosenFiles.length){await appAlert('בחר קבצים קודם');return;}
  const btn=document.getElementById('btnGo');setUploadLock(true);btn.textContent='מתמלל...';
  document.getElementById('modelUsed').textContent='מזהה מודל...';
  lastLines.lines=[];const linesDiv=document.getElementById('lines');
@@ -1637,15 +1698,15 @@ async function transcribe(){if(!chosenFiles.length){alert('בחר קבצים ק�
     if(s.error&&(!s.models_used||!s.models_used.length))
      document.getElementById('modelUsed').textContent='לא נבחר מודל';
     if(s.suggs)for(const k in s.suggs)attachSugg('lines',+k,s.suggs[k]);
-    if(s.error)alert(s.error);break;}
+    if(s.error)await appAlert(s.error,'שגיאת תמלול');break;}
    await new Promise(r=>setTimeout(r,700));}
  }catch(e){document.getElementById('modelUsed').textContent='התמלול נכשל';
-  alert('שגיאה: '+e);}
+  await appAlert('שגיאה: '+e,'התמלול נכשל');}
  document.getElementById('scanProg').style.display='none';
  setUploadLock(false);btn.textContent='🚀 תמלל הכול';
  chosenFiles=[];document.getElementById('fileList').textContent='';
  document.getElementById('file').value='';
- if(!lastLines.lines.length)alert('לא זוהו שורות');}
+ if(!lastLines.lines.length)await appAlert('לא זוהו שורות');}
 
 /* ---------- ייצוא ---------- */
 function expMode(){return document.querySelector('input[name=expMode]:checked').value;}
@@ -1679,7 +1740,7 @@ async function downloadDocxLayout(){const items=collect('lines')
  const blob=await r.blob();const a=document.createElement('a');
  a.href=URL.createObjectURL(blob);a.download='transcript_layout.docx';a.click();}
 async function saveAll(divId,msgId){const w=document.getElementById('writer').value;
- if(!w){alert('הוסף כותב קודם (בלשונית האימון)');return;}
+ if(!w){await appAlert('הוסף כותב קודם (בלשונית האימון)');return;}
  const r=await api('/api/save',{writer:w,lines:collect(divId)});
  let msg='נשמרו '+r.saved+' שורות ✓';
  if(r.quarantined)msg+=' · '+r.quarantined+' ממתינות לאישור בהסגר (בלשונית האימון)';
@@ -1689,7 +1750,7 @@ async function saveAll(divId,msgId){const w=document.getElementById('writer').va
 /* ---------- מודל התיקונים ---------- */
 async function deepSuggest(){const w=document.getElementById('writer').value;
  const items=collect('lines');
- if(!items||!items.length){alert('אין תמלול לנתח');return;}
+ if(!items||!items.length){await appAlert('אין תמלול לנתח');return;}
  const msg=document.getElementById('saveMsg');
  msg.textContent='🧠 מנתח את כל המסמך (הקשר מלא + רצף חוצה-שורות)...';
  try{
@@ -1706,7 +1767,7 @@ async function saveFixes(){const w=document.getElementById('writer').value;
  collect('lines');
  const items=lastLines.lines.filter(l=>l.orig&&l.text&&l.orig!==l.text)
   .map(l=>({orig:l.orig,final:l.text}));
- if(!items.length){alert('אין תיקונים ללמידה — ערוך שורות או החל הצעות קודם');return;}
+ if(!items.length){await appAlert('אין תיקונים ללמידה — ערוך שורות או החל הצעות קודם');return;}
  const r=await api('/api/save_fixes',{writer:w,scope:document.getElementById('fixScope').value,lines:items});
  document.getElementById('saveMsg').textContent=r.msg;loadFixStats();}
 async function loadFixStats(){try{const w=document.getElementById('writer').value;
@@ -1724,13 +1785,13 @@ async function loadFixStats(){try{const w=document.getElementById('writer').valu
   const td=document.createElement('td');
   const ed=document.createElement('button');ed.className='mini';ed.textContent='✏️';
   ed.title='עריכת התיקון — הצורה שתקליד תהפוך לרוב הקובע';
-  ed.onclick=async()=>{const nr=prompt('הצורה הנכונה עבור "'+t.wrong+'":',t.right);
+  ed.onclick=async()=>{const nr=await appPrompt('הצורה הנכונה עבור "'+t.wrong+'":',t.right);
    if(!nr||!nr.trim()||nr.trim()===t.right)return;
    const r=await api('/api/fixes_override',{writer:w,wrong:t.wrong,right:nr.trim()});
    document.getElementById('fixClearMsg').textContent=r.msg;loadFixStats();};
   const dl=document.createElement('button');dl.className='mini';dl.textContent='🗑';
   dl.title='הסרת התיקון מהמודל לגמרי (לא יוצע יותר)';
-  dl.onclick=async()=>{if(!confirm('להסיר את התיקון "'+t.wrong+' ← '+t.right+'" מהמודל?'))return;
+  dl.onclick=async()=>{if(!await appConfirm('להסיר את התיקון "'+t.wrong+' ← '+t.right+'" מהמודל?'))return;
    const r=await api('/api/fixes_remove',{writer:w,wrong:t.wrong});
    document.getElementById('fixClearMsg').textContent=r.msg;loadFixStats();};
   td.appendChild(ed);td.appendChild(dl);tr.appendChild(td);
@@ -1741,6 +1802,7 @@ async function clearFixes(){const w=document.getElementById('writer').value;
  const r=await api('/api/fixes_clear',{writer:w});
  document.getElementById('fixClearMsg').textContent=r.msg;loadFixStats();}
 async function importFixes(){const b64=await readFile('fixFile');
+ if(!b64)return;
  const r=await api('/api/import_fixes',{file:b64});
  document.getElementById('fixMsg').textContent=r.msg;loadFixStats();}
 
@@ -1766,7 +1828,7 @@ async function refreshQuar(){const w=document.getElementById('writer').value;
   why.title=it.reason;why.style.maxWidth='230px';why.style.overflow='hidden';why.style.textOverflow='ellipsis';
   const ok=document.createElement('button');ok.className='btn green';ok.textContent='אשר';
   ok.onclick=async()=>{const r=await api('/api/quarantine_resolve',{writer:w,file:it.file,approve:true,text:inp.value});
-   if(!r.ok)alert(r.msg);refreshQuar();refreshAll(w);};
+   if(!r.ok)await appAlert(r.msg,'אישור שורה נכשל');refreshQuar();refreshAll(w);};
   const no=document.createElement('button');no.className='btn red';no.textContent='מחק';
   no.onclick=async()=>{await api('/api/quarantine_resolve',{writer:w,file:it.file,approve:false});refreshQuar();refreshAll(w);};
   row.appendChild(img);row.appendChild(inp);row.appendChild(why);row.appendChild(ok);row.appendChild(no);
@@ -1775,38 +1837,39 @@ async function refreshQuar(){const w=document.getElementById('writer').value;
 /* ---------- אימון ---------- */
 async function train(scope){const w=document.getElementById('writer').value;
  scope=scope||document.getElementById('trainScope').value;
- if(scope!=='general'&&!w){alert('בחר כותב');return;}
+ if(scope!=='general'&&!w){await appAlert('בחר כותב');return;}
  const r=await api('/api/train',{writer:w,scope:scope});
- if(!r.ok)alert(r.msg);else document.getElementById('trainIdle').textContent=r.msg;}
+ if(!r.ok)await appAlert(r.msg,'האימון לא התחיל');else document.getElementById('trainIdle').textContent=r.msg;}
 async function importGeneral(){const b64=await readFile('generalFile');
+ if(!b64)return;
  document.getElementById('generalMsg').textContent='מעדכן...';
  const r=await api('/api/import_general',{file:b64});
  document.getElementById('generalMsg').textContent=r.msg;
- if(r.ok&&confirm('המודל הכללי עודכן בהצלחה!\nהאם תרצה לעדכן את נתוני האימון האישיים שלך במודל הראשי של התוכנה? (מומלץ — כך המודל החדש ילמד גם את כתב היד שלך)')){
+ if(r.ok&&await appConfirm('המודל הכללי עודכן בהצלחה!\nהאם תרצה לעדכן את נתוני האימון האישיים שלך במודל הראשי של התוכנה? (מומלץ — כך המודל החדש ילמד גם את כתב היד שלך)')){
   train('general');}}
 async function uploadPack(){const w=document.getElementById('writer').value;
- if(!w){alert('בחר כותב');return;}
- if(!confirm('לשלוח את נתוני האימון של "'+w+'" למפתח התוכנה?\nנשלחים רק נתונים שאתה יצרת (תמונות שורות והטקסט שלהן).'))return;
+ if(!w){await appAlert('בחר כותב');return;}
+ if(!await appConfirm('לשלוח את נתוני האימון של "'+w+'" למפתח התוכנה?\nנשלחים רק נתונים שאתה יצרת (תמונות שורות והטקסט שלהן).'))return;
  document.getElementById('uploadMsg').textContent='שולח... (זה יכול לקחת דקה)';
  const r=await api('/api/upload_pack',{writer:w});
  document.getElementById('uploadMsg').textContent=r.msg;}
 async function saveConfig(){const r=await api('/api/config',{upload_url:document.getElementById('uploadUrl').value.trim()});
- alert('נשמר');}
+ await appAlert('נשמר','ההגדרות נשמרו');}
 async function deleteTrainData(){const w=document.getElementById('writer').value;
  const msg=document.getElementById('cleanMsg');
- if(!w){alert('בחר כותב');return;}
- if(!confirm('למחוק את קובצי האימון של "'+w+'"?\n\nלא מומלץ: הקבצים משמשים גיבוי ויידרשו לאימון מחדש אחרי עדכון מודל עתידי.\nהמודלים המאומנים לא יימחקו והתמלול ימשיך לעבוד כרגיל.'))return;
- if(confirm('לשלוח את הנתונים למפתח לפני המחיקה?\n(מומלץ — כך הם ישפרו את המודל הכללי ולא ילכו לאיבוד)')){
+ if(!w){await appAlert('בחר כותב');return;}
+ if(!await appConfirm('למחוק את קובצי האימון של "'+w+'"?\n\nלא מומלץ: הקבצים משמשים גיבוי ויידרשו לאימון מחדש אחרי עדכון מודל עתידי.\nהמודלים המאומנים לא יימחקו והתמלול ימשיך לעבוד כרגיל.'))return;
+ if(await appConfirm('לשלוח את הנתונים למפתח לפני המחיקה?\n(מומלץ — כך הם ישפרו את המודל הכללי ולא ילכו לאיבוד)')){
   msg.textContent='שולח למפתח לפני המחיקה... (זה יכול לקחת דקה)';
   const u=await api('/api/upload_pack',{writer:w});
-  if(!u.ok&&!confirm('השליחה נכשלה: '+u.msg+'\nלמחוק בכל זאת?')){msg.textContent=u.msg;return;}}
+  if(!u.ok&&!await appConfirm('השליחה נכשלה: '+u.msg+'\nלמחוק בכל זאת?')){msg.textContent=u.msg;return;}}
  const r=await api('/api/delete_train_data',{writer:w});
  msg.textContent=r.msg;refreshAll(w);}
 async function loadConfig(){try{const c=await api('/api/config');
  if(c.upload_url)document.getElementById('uploadUrl').value=c.upload_url;}catch(e){}}
 loadConfig();
 async function stopTrain(){const r=await api('/api/train_stop',{});
- if(!r.stopped)alert('לא נמצא אימון רץ');}
+ if(!r.stopped)await appAlert('לא נמצא אימון רץ');}
 function drawCer(cers){const el=document.getElementById('cerChart');
  if(!cers||!cers.length){el.textContent='אין נתונים עדיין';return;}
  const w=460,h=130,max=Math.max(...cers,1),n=cers.length;
@@ -1858,45 +1921,49 @@ async function addWriter(){const n=document.getElementById('newWriter').value.tr
  await api('/api/writers',{name:n});document.getElementById('newWriter').value='';refreshAll(n);}
 async function deleteWriter(){const w=document.getElementById('writer').value;
  const msg=document.getElementById('delWriterMsg');
- if(!w){alert('בחר כותב (למעלה, ליד הכותרת)');return;}
- if(!confirm('⚠️ אזהרה חמורה ⚠️\n\nמחיקת הכותב "'+w+'" תמחק לצמיתות:\n• את כל נתוני האימון שלו (תמונות השורות והתיוגים)\n• את המודל האישי המאומן שלו (כולל גרסאות הארכיון)\n\nזה בלתי הפיך! להמשיך?'))return;
- if(confirm('מומלץ מאוד: להוריד עכשיו גיבוי מלא של הכותב (חבילת אימון + המודל)?\n\nאישור = הורדת הגיבוי · ביטול = דילוג על הגיבוי')){
+ if(!w){await appAlert('בחר כותב (למעלה, ליד הכותרת)');return;}
+ if(!await appConfirm('⚠️ אזהרה חמורה ⚠️\n\nמחיקת הכותב "'+w+'" תמחק לצמיתות:\n• את כל נתוני האימון שלו (תמונות השורות והתיוגים)\n• את המודל האישי המאומן שלו (כולל גרסאות הארכיון)\n\nזה בלתי הפיך! להמשיך?'))return;
+ if(await appConfirm('מומלץ מאוד: להוריד עכשיו גיבוי מלא של הכותב (חבילת אימון + המודל)?\n\nאישור = הורדת הגיבוי · ביטול = דילוג על הגיבוי')){
   location.href='/api/export_writer?name='+encodeURIComponent(w);
   await new Promise(r=>setTimeout(r,1500));
-  if(!confirm('הגיבוי החל לרדת (בדוק בתיקיית ההורדות).\n\nלמחוק את "'+w+'" סופית עכשיו?'))return;
- }else if(!confirm('למחוק את "'+w+'" סופית בלי גיבוי?'))return;
+  if(!await appConfirm('הגיבוי החל לרדת (בדוק בתיקיית ההורדות).\n\nלמחוק את "'+w+'" סופית עכשיו?'))return;
+ }else if(!await appConfirm('למחוק את "'+w+'" סופית בלי גיבוי?'))return;
  const r=await api('/api/delete_writer',{writer:w});
- msg.textContent=r.msg;if(!r.ok)alert(r.msg);
+ msg.textContent=r.msg;if(!r.ok)await appAlert(r.msg,'מחיקת כותב נכשלה');
  refreshAll();}
 async function makeTemplates(){const r=await api('/api/templates/make',{count:10});
  document.getElementById('tmplMsg').textContent='נוצרו: '+r.made.join(', ');refreshAll();}
 async function makeCustom(){const t=document.getElementById('customText').value;
- if(!t.trim()){alert('הקלד משפטים');return;}
+ if(!t.trim()){await appAlert('הקלד משפטים');return;}
  const r=await api('/api/templates/custom',{text:t});
  document.getElementById('customMsg').textContent='נוצרו: '+r.made.join(', ')+' — הורד ZIP והדפס';refreshAll();}
 async function ingestTemplate(){const w=document.getElementById('writer').value;
- if(!w){alert('בחר כותב');return;}
+ if(!w){await appAlert('בחר כותב');return;}
  const b64=await readFile('tmplFile');
+ if(!b64)return;
  const r=await api('/api/ingest_template',{img:b64,template:document.getElementById('tmplName').value,writer:w});
  document.getElementById('ingestMsg').textContent=r.msg;refreshAll(w);}
 async function parallelMatch(){const b64=await readFile('parFile');
+ if(!b64)return;
  const r=await api('/api/parallel',{img:b64,text:document.getElementById('parText').value});
  lastLines.parLines=r.lines||[];document.getElementById('parLines').innerHTML='';
  document.getElementById('parLines').dataset.lastSrc='';
  appendLines('parLines',lastLines.parLines,0);
  document.getElementById('parCard').style.display='block';
  document.getElementById('parMsg').textContent=r.note||'';}
-function exportPack(){const w=document.getElementById('writer').value;
- if(!w){alert('בחר כותב');return;}
+async function exportPack(){const w=document.getElementById('writer').value;
+ if(!w){await appAlert('בחר כותב');return;}
  location.href='/api/export_writer?name='+encodeURIComponent(w);}
 async function importPack(){const w=document.getElementById('packWriter').value.trim();
- if(!w){alert('תן שם לכותב');return;}
+ if(!w){await appAlert('תן שם לכותב');return;}
  const b64=await readFile('packFile');
+ if(!b64)return;
  const r=await api('/api/import_pack',{zip:b64,writer:w});
  document.getElementById('packMsg').textContent=r.msg;refreshAll(w);}
 async function importModel(){const n=document.getElementById('modelName').value.trim();
- if(!n){alert('תן שם');return;}
+ if(!n){await appAlert('תן שם');return;}
  const b64=await readFile('modelFile');
+ if(!b64)return;
  const r=await api('/api/import_model',{file:b64,name:n});
  document.getElementById('modelMsg').textContent=r.msg;refreshAll();}
 refreshAll();pollTrain();

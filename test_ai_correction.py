@@ -154,6 +154,23 @@ class AICorrectionTests(unittest.TestCase):
         self.assertEqual(result["corrections"],
                          [{"index": 0, "text": "תמלול מתוקן"}])
 
+    def test_unavailable_models_report_refresh_action_instead_of_quota_failure(self):
+        ai_correction.add_key("work", "key-one")
+
+        with patch("ai_correction._request_gemini", side_effect=(
+                ai_correction._RotateKey(
+                    "המודל שנבחר אינו זמין למפתח הזה; יש לרענן את רשימת המודלים"))):
+            with self.assertRaises(ai_correction.AIStudioError) as context:
+                ai_correction.correct_lines([{
+                    "img": base64.b64encode(b"png").decode("ascii"),
+                    "text": "תמלול מקורי",
+                }])
+
+        message = str(context.exception)
+        self.assertIn("טען מחדש את רשימת המודלים", message)
+        self.assertIn("work", message)
+        self.assertNotIn("מכסתם הסתיימה", message)
+
     def test_identical_response_is_not_a_suggestion(self):
         ai_correction.add_key("only", "secret")
         with patch("ai_correction._request_gemini", return_value=(

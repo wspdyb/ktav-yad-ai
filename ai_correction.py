@@ -480,9 +480,15 @@ def _correct_batch(lines):
             return item["name"], model, corrections, usage
         except _RotateKey as exc:
             failures.append(f"{item['name']}: {exc}")
+    if failures and all("המודל שנבחר אינו זמין" in failure
+                        for failure in failures):
+        raise AIStudioError(
+            "המודל שנבחר אינו זמין למפתחות שנבדקו. פתח את ניהול מפתחות "
+            "AI, טען מחדש את רשימת המודלים עבור כל מפתח ובחר מודל זמין. "
+            "פרטים: " + " | ".join(failures))
     raise AIStudioError(
-        "כל מפתחות ה-API שנוסו נדחו או שמכסתם הסתיימה. "
-        + " | ".join(failures))
+        f"אף אחד מ-{len(failures)} מפתחות ה-API לא הצליח להשלים את הבקשה. "
+        "הסיבות שדווחו: " + " | ".join(failures))
 
 
 def correct_lines(lines, batch_size=BATCH_SIZE):
