@@ -2,11 +2,8 @@
 r"""ניהול נתיבים מרכזי — ההפרדה בין קבצי התוכנה לקבצי הנתונים.
 
 בהרצה רגילה (פיתוח): הנתונים בתיקיית הפרויקט.
-בהרצה כ-EXE ארוז: הנתונים בתיקייה קבועה ונפרדת —
-    %LOCALAPPDATA%\KtavYadAI
-כך שהאריזה לעולם לא "ננעלת": כל אימון, תיקון וייבוא נשמרים בתיקייה החיצונית,
-שממשיכה לצבור נתונים בין גרסה לגרסה. בהפעלה הראשונה של ה-EXE מועתקים אליה
-המודלים והנתונים ההתחלתיים שנארזו בפנים (זריעה חד-פעמית).
+בהרצה כ-EXE ארוז: הנתונים נשמרים בתיקיות data/ ו-models/ לצד ה-EXE,
+כך שאפשר להעביר את התוכנה ואת נתוני האימון שלה יחד למחשב אחר.
 """
 import os
 import sys
@@ -22,11 +19,10 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 if FROZEN:
-    # קבצי התוכנה הארוזים (לקריאה בלבד)
+    # PyInstaller one-file extracts its read-only bundle to _MEIPASS.
     BUNDLE = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
-    # תיקיית הנתונים החיצונית הקבועה
-    BASE = os.path.join(os.environ.get("LOCALAPPDATA",
-                                       os.path.expanduser("~")), "KtavYadAI")
+    # Keep writable user data beside the executable for portability.
+    BASE = os.path.dirname(os.path.abspath(sys.executable))
 else:
     BUNDLE = os.path.dirname(os.path.abspath(__file__))
     BASE = BUNDLE
@@ -46,7 +42,7 @@ UPLOADS_DIR = os.path.join(DATA_DIR, "uploads")
 
 
 def _seed_once():
-    """בהפעלה ראשונה של EXE: מעתיק את המודלים והנתונים הארוזים לתיקייה החיצונית."""
+    """Create writable folders and seed missing assets beside a frozen EXE."""
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(MODELS_DIR, exist_ok=True)
     os.makedirs(WRITERS_DIR, exist_ok=True)
@@ -61,8 +57,7 @@ def _seed_once():
         dst = os.path.join(DATA_DIR, name)
         if not os.path.exists(dst) and os.path.exists(src):
             shutil.copy2(src, dst)
-    # מודלים ארוזים — מועתקים אם חסרים בחוץ, או אם הגרסה הארוזה חדשה יותר
-    # (כך פרסום גרסה חדשה של התוכנה מעדכן את המודלים אצל משתמשים קיימים)
+    # Never replace an existing model: it may contain the user's training.
     src_models = os.path.join(BUNDLE, "models")
     if os.path.isdir(src_models):
         for f in os.listdir(src_models):
@@ -70,8 +65,7 @@ def _seed_once():
                 continue
             src = os.path.join(src_models, f)
             dst = os.path.join(MODELS_DIR, f)
-            if not os.path.exists(dst) or \
-                    os.path.getmtime(src) > os.path.getmtime(dst) + 60:
+            if not os.path.exists(dst):
                 shutil.copy2(src, dst)
     # כותבים ארוזים (נתוני אימון התחלתיים) — זריעה רק לכותבים שלא קיימים
     src_writers = os.path.join(BUNDLE, "data", "writers")

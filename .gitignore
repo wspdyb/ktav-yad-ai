@@ -11,6 +11,7 @@ models/*
 
 # ===== ארטיפקטים / סביבה =====
 dist/
+release/
 build/
 venv/
 *.zip

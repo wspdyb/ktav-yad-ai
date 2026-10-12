@@ -17,12 +17,14 @@ import re
 import json
 import base64
 import ctypes
+import importlib
+import logging
+import shutil
 import zipfile
 import threading
 import subprocess
 import sys
 import time
-import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 from xml.sax.saxutils import escape as xml_escape
@@ -30,13 +32,14 @@ from xml.sax.saxutils import escape as xml_escape
 import torch
 from PIL import Image
 
-from paths import MODELS_DIR as MODELS, UPLOADS_DIR, FROZEN
+from paths import BUNDLE, DATA_DIR, MODELS_DIR as MODELS, UPLOADS_DIR, FROZEN
 from charset import CHARSET, NUM_CLASSES, clean, decode_ctc, to_logical
 from model import load_checkpoint
 from segment import (segment_page, segment_page_ex, WRITERS_DIR, TEMPLATES_DIR,
                      ingest_template)
 from infer import (pil_to_array, transcribe_with_conf, transcribe_rescued,
                    bold_word_indices)
+import ai_correction
 import postfix
 import gates
 import fixes
@@ -45,6 +48,9 @@ import fixes
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+VERSION = "1.0.1"
+WINDOW_SIZE_PATH = os.path.join(DATA_DIR, "window_size.json")
+DEFAULT_WINDOW_SIZE = (1220, 880)
 PORT = 8765
 PID_FILE = os.path.join(MODELS, "train.pid")
 
@@ -484,7 +490,10 @@ def _run_transcribe_job(job_id, files, page_mode, writer, prefer, use_fix):
                 tm, tk = get_model(None, "typed")
                 if tk == "__typed__":
                     page_model, page_key = tm, tk
-            job["model"] = page_key
+            with _jobs_lock:
+                job["model"] = page_key
+                if page_key not in job["models_used"]:
+                    job["models_used"].append(page_key)
             for k, (im, geom) in enumerate(items):
                 path_info = {} if geom and geom.get("em_spans") else None
                 rescued = transcribe_rescued(page_model, im, med_h,
@@ -520,7 +529,9 @@ def _run_transcribe_job(job_id, files, page_mode, writer, prefer, use_fix):
                     is_note = len(items) > 3 and im2.height < med_h * 0.62
                     with _jobs_lock:
                         job["lines"].append({"img": img_to_b64(im2), "text": text,
-                                             "src": label, "conf": round(conf, 3),
+                                             "src": label, "page": p_idx,
+                                             "ai_crop": page_mode,
+                                             "conf": round(conf, 3),
                                              "note": is_note, "geom": geom,
                                              "sugg": sugg, "bold": bold,
                                              "typed": is_typed_page})
@@ -558,7 +569,8 @@ def _run_transcribe_job(job_id, files, page_mode, writer, prefer, use_fix):
 def start_transcribe(files, page_mode, writer, prefer, use_fix=True):
     job_id = str(int(time.time() * 1000))
     _jobs[job_id] = {"pages_total": 0, "pages_done": 0, "cur": "", "lines": [],
-                     "done": False, "error": None, "model": None, "progress": 0.0}
+                     "done": False, "error": None, "model": None,
+                     "models_used": [], "progress": 0.0}
     threading.Thread(target=_run_transcribe_job,
                      args=(job_id, files, page_mode, writer, prefer, use_fix),
                      daemon=True).start()
@@ -890,7 +902,8 @@ def list_templates():
 # ---------------------------------------------------------------- HTML
 HTML = r"""<!DOCTYPE html>
 <html dir="rtl" lang="he"><head><meta charset="utf-8">
-<title>כתב-יד AI — תמלול אישי</title>
+<link rel="icon" href="/favicon.ico">
+<title>כתב-יד AI 1.0.1 — תמלול אישי</title>
 <style>
  :root{--navy:#141e3c;--blue:#1d4e89;--teal:#0e7c7b;--green:#17805a;--bg:#eef1f6;--card:#fff;--line:#e3e7ef}
  *{box-sizing:border-box}
@@ -923,6 +936,8 @@ HTML = r"""<!DOCTYPE html>
  .line img{max-width:40%;max-height:42px;border:1px solid var(--line);border-radius:3px;background:#fff;object-fit:contain;margin-top:2px;cursor:zoom-in}
  .line img.zoom{max-width:75%;max-height:140px;cursor:zoom-out}
  .line .num{min-width:20px;text-align:center;color:#98a1b5;font-size:10.5px;margin-top:6px}
+ .line .aiRowSelect{display:none;margin-top:7px;flex:0 0 auto}
+ body.aiManualSelection .line .aiRowSelect{display:inline-block}
  .line textarea.lt{flex:1;font-size:14.5px;line-height:1.4;direction:rtl;border:0;background:transparent;
   padding:3px 6px;border-bottom:1px solid transparent;resize:none;overflow:hidden;min-height:24px;font-family:inherit}
  .line textarea.lt:focus{outline:none;border-bottom:2px solid var(--teal)}
@@ -956,7 +971,8 @@ HTML = r"""<!DOCTYPE html>
   <option value="general">המודל הכללי</option>
   <option value="typed">טקסט מוקלד / צילום מסך</option>
  </select>
- <span id="writerInfo" class="pill gray"></span>
+  <span id="modelUsed" class="pill gray" title="המודל או המודלים שנבחרו בפועל לעבודה האחרונה"></span>
+  <span id="writerInfo" class="pill gray"></span>
 </header>
 <nav>
  <button class="active" onclick="showTab('tabScan',this)">📄 תמלול</button>
@@ -980,7 +996,6 @@ HTML = r"""<!DOCTYPE html>
    <label><input type="checkbox" id="pageMode" checked> עמודים מלאים (פילוח אוטומטי לשורות)</label>
    <label><input type="checkbox" id="fixMode" checked> תיקון מילוני אוטומטי</label>
    <button class="btn" onclick="transcribe()" id="btnGo">🚀 תמלל הכול</button>
-   <span id="modelUsed" class="muted"></span>
   </div>
  </div>
  <div class="card" id="scanProg" style="display:none">
@@ -992,6 +1007,15 @@ HTML = r"""<!DOCTYPE html>
   <b class="title">תוצאות</b> <span class="muted">— עריכה רציפה: אנטר/חצים עוברים בין השורות · ✖ מוחק שורת סרק · ⤴ ממזג לשורה הקודמת</span>
   <div id="magBar"><img id="magImg" alt=""></div>
   <div id="lines"></div>
+  <div id="aiReview" class="card" style="display:none;margin-top:12px">
+   <b class="title">הצעות תיקון מ-Google AI Studio — טיוטה לבדיקה</b>
+   <p class="muted">התמונות והטקסט שזוהה נשלחו ל-Google רק בעקבות לחיצה על „הצע תיקון AI”.
+    ההצעות אינן נשמרות או מאומנות אוטומטית. בדוק כל שינוי, החל רק את המתאימים,
+    ערוך לפי הצורך, ורק אז שמור לאימון.</p>
+    <button class="btn green" onclick="applyAllAICorrections()">החל את כל ההצעות לטיוטה</button>
+    <div id="aiReviewList"></div>
+   <span id="aiReviewMsg" class="muted"></span>
+  </div>
   <div class="exportBar">
    <b>ייצוא:</b>
    <label><input type="radio" name="expMode" value="orig" checked> שורות כמו במקור</label>
@@ -999,6 +1023,33 @@ HTML = r"""<!DOCTYPE html>
    <label><input type="radio" name="expMode" value="dots"> ירידת שורה רק אחרי נקודה</label>
    <button class="btn" style="background:#6a3fa0" onclick="deepSuggest()"
     title="ניתוח כל המסמך במקביל: אוצר המילים של כל העמודים + רצף ההקשר חוצה-השורות">🧠 תיקון מורחב (ניתוח כל המסמך)</button>
+   <label>היקף AI:
+    <select id="aiScope" onchange="updateAISelectionControls()">
+     <option value="lines">שורות ראשונות</option>
+     <option value="pages">עמודים ראשונים (כל חיתוכי השורות)</option>
+     <option value="manual">בחירה ידנית של שורות</option>
+    </select>
+   </label>
+   <label id="aiAmountControl">כמות:
+    <input id="aiAmount" type="number" value="8" min="1" step="1"
+     style="width:76px" onchange="updateAISelectionControls()">
+   </label>
+   <span id="aiManualControls" style="display:none">
+    <button class="mini" type="button" onclick="setAISelection(true)">בחר הכול</button>
+    <button class="mini" type="button" onclick="invertAISelection()">הפוך בחירה</button>
+    <button class="mini" type="button" onclick="setAISelection(false)">נקה בחירה</button>
+   </span>
+   <label title="מספר חיתוכי השורות בכל בקשת רשת; יותר שורות בבקשה מפחית בקשות נפרדות">
+    שורות לבקשה:
+    <select id="aiBatchSize">
+     <option value="1">1</option>
+     <option value="2">2</option>
+     <option value="4">4</option>
+     <option value="8" selected>8</option>
+    </select>
+   </label>
+   <button class="btn" style="background:#7352a3" id="aiCorrectBtn" onclick="aiCorrect()">✨ הצע תיקון AI</button>
+   <span id="aiSelectionInfo" class="muted"></span>
    <button class="btn" style="background:#b8860b" onclick="applyAllSuggs()">💡 החל את כל ההצעות</button>
    <button class="btn" onclick="copyText()">📋 העתק</button>
    <button class="btn" onclick="downloadTxt()">⬇️ TXT</button>
@@ -1017,6 +1068,30 @@ HTML = r"""<!DOCTYPE html>
 </div>
 
 <div id="tabTrain" style="display:none">
+ <div class="card">
+  <b class="title">✨ תיקון תמלול בעזרת Google AI Studio</b>
+  <p class="muted">הוסף מפתחות API מ-Google AI Studio; לכל מפתח אפשר לתת שם.
+   אם מפתח מגיע למכסה שלו, התוכנה תנסה מפתח אחר שהוספת.
+   המפתחות נשמרים מוצפנים לחשבון Windows הנוכחי ואינם נכללים בחבילות האימון.
+   אפשר לבחור מספר שורות או עמודים; חיתוכי השורות נשלחים בבקשות קטנות ברצף.</p>
+  <p class="muted">מפתחות ששייכים לאותו פרויקט חולקים את אותה מכסה; הוספת מפתחות
+   מאותו פרויקט אינה מגדילה אותה. בזמן תיקון, שגיאת מכסה או הרשאה תעביר למפתח הבא;
+   שגיאת חיבור תוצג ולא תגרום לניסיונות מיותרים עם כל המפתחות.</p>
+  <p class="muted"><a href="https://aistudio.google.com/rate-limit?timeRange=last-28-days"
+   target="_blank" rel="noreferrer">צפה במכסות ובשימוש הפעיל ב-Google AI Studio</a>
+   — יתרת המכסה אינה זמינה בתשובת ה-API.</p>
+  <p class="muted"><b>פרטיות:</b> תמונות השורות והטקסט שזוהה נשלחים ל-Google רק כשלוחצים
+   על „✨ הצע תיקון AI”. אין שליחה אוטומטית בזמן תמלול, שמירה או אימון.</p>
+  <div>
+   <input type="text" id="aiKeyName" maxlength="60" placeholder="שם למפתח, למשל אישי">
+   <input type="password" id="aiKeyValue" autocomplete="new-password" placeholder="מפתח API של Google AI Studio">
+   <button class="btn" onclick="addAIKey()">➕ שמור מפתח</button>
+   <span id="aiKeyMsg" class="muted"></span>
+  </div>
+  <button class="btn" id="aiKeysCheckAll" onclick="checkAllAIKeys()">🔄 בדוק/רענן חיבור לכל המפתחות</button>
+  <span class="muted">בדיקת החיבור אינה שולחת תמונות ואינה בודקת מכסת יצירה; היא מאמתת גישה למודל.</span>
+  <div id="aiKeyList" class="muted" style="margin-top:10px"></div>
+ </div>
  <div class="grid2">
   <div class="card"><b class="title">מצב האימון</b>
    <div id="trainIdle" class="muted" style="margin-top:8px">אין אימון פעיל.</div>
@@ -1211,6 +1286,14 @@ function appendLines(divId,arr,offset){const div=document.getElementById(divId);
    div.dataset.lastSrc=l.src;}
   const row=document.createElement('div');row.className='line';
   const num=document.createElement('span');num.className='num';num.textContent=i+1;
+  if(divId==='lines'){
+   const select=document.createElement('input');select.type='checkbox';
+   select.className='aiRowSelect';select.title='כלול שורה זו בבקשת תיקון AI';
+   select.checked=l.ai_crop!==false;select.disabled=l.ai_crop===false;
+   select.dataset.aiIndex=i;
+   select.addEventListener('change',updateAISelectionControls);
+   row.appendChild(select);
+  }
   const img=document.createElement('img');img.src='data:image/png;base64,'+l.img;
   img.onclick=()=>img.classList.toggle('zoom');
   const inp=document.createElement('textarea');inp.className='lt';inp.rows=1;
@@ -1237,16 +1320,19 @@ function appendLines(divId,arr,offset){const div=document.getElementById(divId);
    row.appendChild(sg);}
   const del=document.createElement('button');del.className='mini';del.textContent='✖';
   del.title='מחק שורה (סרק/קו הדגשה)';
-  del.onclick=()=>{inp.value='';l.text='';row.style.display='none';};
+  del.onclick=()=>{inp.value='';l.text='';row.style.display='none';
+   if(divId==='lines')updateAISelectionControls();};
   const mrg=document.createElement('button');mrg.className='mini';mrg.textContent='⤴';
   mrg.title='מזג את הטקסט לשורה הקודמת';
   mrg.onclick=()=>{const prev=document.querySelector('#'+divId+' textarea.lt[data-i="'+(i-1)+'"]');
    if(!prev){alert('אין שורה קודמת');return;}
    prev.value=(prev.value.trim()+' '+inp.value.trim()).trim();autoGrow(prev);
    const it=lastLines[divId][i-1];if(it)it.text=prev.value;
-   inp.value='';l.text='';row.style.display='none';};
+   inp.value='';l.text='';row.style.display='none';
+   if(divId==='lines')updateAISelectionControls();};
   row.appendChild(del);row.appendChild(mrg);
-  div.appendChild(row);requestAnimationFrame(()=>autoGrow(inp));});}
+  div.appendChild(row);requestAnimationFrame(()=>autoGrow(inp));});
+ if(divId==='lines')updateAISelectionControls();}
 function attachSugg(divId,i,sugg){/* עדכון 💡 לשורה שכבר הוצגה (מעבר ההקשר השני) */
  const inp=document.querySelector('#'+divId+' textarea.lt[data-i="'+i+'"]');
  if(!inp)return;const row=inp.closest('.line');const l=lastLines[divId][i];if(!l)return;
@@ -1261,12 +1347,266 @@ function moveFocus(divId,i,d){const nxt=document.querySelector('#'+divId+' texta
 function collect(divId){document.querySelectorAll('#'+divId+' textarea.lt').forEach(inp=>{
   const it=lastLines[divId][+inp.dataset.i];if(it)it.text=inp.value;});return lastLines[divId];}
 
+/* ---------- תיקון טיוטה עם AI ---------- */
+let aiCorrections=[],aiMetricsSummary='';
+function getVisibleAILines(syncText=true){
+ const items=syncText?collect('lines'):lastLines.lines,visible=[];
+ document.querySelectorAll('#lines textarea.lt').forEach(inp=>{
+  const row=inp.closest('.line');
+  if(!row||row.style.display==='none')return;
+  const index=Number(inp.dataset.i),item=items[index];
+  if(item)visible.push({
+   index,item,pageKey:item.page==null?item.src:item.page,
+   aiCrop:item.ai_crop!==false,
+   selected:!!row.querySelector('.aiRowSelect')?.checked});
+ });
+ return visible;
+}
+function setAISelection(selected){
+ document.querySelectorAll('#lines .line .aiRowSelect:not(:disabled)').forEach(input=>{
+  if(input.closest('.line').style.display!=='none')input.checked=selected;
+ });
+ updateAISelectionControls();
+}
+function invertAISelection(){
+ document.querySelectorAll('#lines .line .aiRowSelect:not(:disabled)').forEach(input=>{
+  if(input.closest('.line').style.display!=='none')input.checked=!input.checked;
+ });
+ updateAISelectionControls();
+}
+function updateAISelectionControls(){
+ const allVisible=getVisibleAILines(false),visible=allVisible.filter(x=>x.aiCrop);
+ const pages=[...new Set(visible.map(x=>x.pageKey))];
+ const scope=document.getElementById('aiScope'),amount=document.getElementById('aiAmount');
+ if(!scope||!amount)return;
+ const manual=scope.value==='manual';
+ document.body.classList.toggle('aiManualSelection',manual);
+ document.getElementById('aiManualControls').style.display=manual?'inline-flex':'none';
+ document.getElementById('aiAmountControl').style.display=manual?'none':'inline';
+ const max=scope.value==='pages'?pages.length:visible.length;
+ amount.max=String(max);
+ amount.value=String(Math.min(Math.max(1,Number(amount.value)||1),Math.max(1,max)));
+ document.getElementById('aiSelectionInfo').textContent=
+  !visible.length&&allVisible.length
+   ? 'לתיקון AI יש לתמלל עם פילוח אוטומטי לשורות.'
+   : manual
+    ? `נבחרו ${visible.filter(x=>x.selected).length} מתוך ${visible.length} שורות זמינות לשליחה.`
+   : scope.value==='pages'
+    ? `${pages.length} עמודים זמינים; יישלחו חיתוכי השורות של ${Math.min(Number(amount.value),pages.length)} עמודים.`
+    : `${visible.length} שורות זמינות; יישלחו ${Math.min(Number(amount.value),visible.length)} חיתוכים.`;
+}
+async function aiCorrect(){
+ updateAISelectionControls();
+ const allVisible=getVisibleAILines(),visible=allVisible.filter(x=>x.aiCrop);
+ const scope=document.getElementById('aiScope').value;
+ const amount=Number(document.getElementById('aiAmount').value);
+ const pages=[...new Set(visible.map(x=>x.pageKey))];
+ const selected=scope==='manual'
+  ? visible.filter(x=>x.selected)
+  : scope==='pages'
+   ? visible.filter(x=>pages.slice(0,amount).includes(x.pageKey))
+   : visible.slice(0,amount);
+ if(!selected.length){
+  alert(allVisible.some(x=>!x.aiCrop)
+   ? 'כדי לשלוח חיתוכי שורות ל-AI, סמן "עמודים מלאים (פילוח אוטומטי לשורות)" ותמלל מחדש.'
+   : scope==='manual'?'סמן לפחות שורה אחת לשליחה לתיקון AI.':'אין שורות גלויות לשליחה לתיקון');
+  return;
+ }
+ const btn=document.getElementById('aiCorrectBtn'),msg=document.getElementById('saveMsg');
+ btn.disabled=true;msg.textContent=`שולח ${selected.length} חיתוכי שורות ל-Google AI Studio...`;
+ try{
+  const r=await api('/api/ai_correct',{
+   lines:selected.map(x=>({img:x.item.img,text:x.item.text})),
+   batch_size:Number(document.getElementById('aiBatchSize').value)});
+  if(r.error)throw Error(r.error);
+  aiCorrections=(r.corrections||[]).map(c=>({
+   ...c,index:selected[c.index].index,lineNumber:selected[c.index].index+1,
+   original:selected[c.index].item.text,applied:false,skipped:false}));
+  renderAIReview(r.keys_used||[],r.metrics||{},r.warning||'');
+  msg.textContent=`התקבלו ${aiCorrections.length} הצעות. הן עדיין טיוטה ולא נשמרו.`+
+   (r.warning?' '+r.warning:'');
+ }catch(e){msg.textContent='';alert('תיקון AI נכשל: '+e.message);}
+ finally{btn.disabled=false;}}
+function renderAIReview(keys,metrics,warning){
+ const panel=document.getElementById('aiReview'),list=document.getElementById('aiReviewList');
+ list.replaceChildren();
+ const usage=metrics.total_tokens==null?'טוקנים: לא דווחו על ידי השירות':
+  `טוקנים: ${metrics.total_tokens} בסך הכול (קלט ${metrics.prompt_tokens}, פלט ${metrics.output_tokens})`;
+ const batches=(metrics.batches||[]).map((b,i)=>
+  `בקשה ${i+1}: ${b.line_count} שורות, ${(b.image_bytes/1024).toFixed(1)}KB תמונות, `+
+  `${(b.request_bytes/1024).toFixed(1)}KB נשלחו, `+
+  `${b.elapsed_seconds}s, ${b.total_tokens==null?'טוקנים לא דווחו':b.total_tokens+' טוקנים'}`).join(' · ');
+ const stats=`${metrics.line_count||0} שורות ב-${metrics.batch_count||0} בקשות; `+
+  `זמן כולל ${metrics.elapsed_seconds||0}s; ${usage}. ${batches}. `+
+  `יתרת מכסה אינה מדווחת דרך בקשת התיקון; טוקני הקלט כוללים גם תמונות.`+
+  (warning?` ${warning}`:'');
+ aiMetricsSummary=stats;
+ if(!aiCorrections.length){panel.style.display='block';
+  document.getElementById('aiReviewMsg').textContent='לא נמצאו שורות לשינוי. '+stats;
+  return;}
+ panel.style.display='block';
+ for(const c of aiCorrections){
+  const row=document.createElement('div');row.className='line';row.style.cssText='padding:8px;border-bottom:1px solid #e3e7ef;flex-wrap:wrap';
+  const label=document.createElement('b');label.textContent='שורה '+c.lineNumber+': ';
+  const before=document.createElement('span');before.className='muted';before.textContent='זוהה: '+c.original;
+  const after=document.createElement('span');after.style.cssText='font-weight:600;color:#145c42';after.textContent='הצעת AI: '+c.text;
+  const apply=document.createElement('button');apply.className='btn green';apply.textContent='החל לטיוטה';
+  apply.onclick=()=>{applyAICorrection(c);apply.disabled=true;apply.textContent='הוחל בטיוטה';};
+  const skip=document.createElement('button');skip.className='btn';skip.textContent='השאר מקור';
+  skip.onclick=()=>{c.skipped=true;row.style.display='none';updateAIReviewStatus();};
+  row.append(label,before,after,apply,skip);list.appendChild(row);}
+ document.getElementById('aiReviewMsg').textContent=
+  `${stats}. מפתח/ות: ${keys.length?keys.join(', '):'—'}. `+
+  `ההצעות לא נשמרות עד שתלחץ בעצמך על שמירה לאימון.`;
+}
+function applyAICorrection(c){
+ const item=lastLines.lines[c.index];
+ const input=document.querySelector('#lines textarea.lt[data-i="'+c.index+'"]');
+ if(!item||!input)return;
+ item.text=c.text;input.value=c.text;autoGrow(input);c.applied=true;updateAIReviewStatus();}
+function applyAllAICorrections(){
+ let applied=0;
+ for(const c of aiCorrections){if(!c.applied&&!c.skipped){applyAICorrection(c);applied++;}}
+ document.getElementById('aiReviewMsg').textContent=
+  'הוחלו '+applied+' הצעות בטיוטה. עבור על הטקסט וערוך לפי הצורך לפני שמירה לאימון. '+
+  aiMetricsSummary;}
+function updateAIReviewStatus(){
+ const applied=aiCorrections.filter(c=>c.applied).length;
+ const skipped=aiCorrections.filter(c=>c.skipped).length;
+ document.getElementById('aiReviewMsg').textContent=
+  'הוחלו '+applied+' הצעות בטיוטה; '+skipped+' נדחו. ניתן לערוך את השורות לפני שמירה לאימון. '+
+  aiMetricsSummary;}
+let aiKeyChecks=Object.create(null);
+function aiKeyStatusText(check){
+ if(!check)return 'לא נבדק';
+ const labels={
+  connected:'✅ מחובר — מכסת יצירה לא נבדקה',
+  rejected:'❌ מפתח נדחה/אין הרשאה',
+  quota:'⚠️ שירות דיווח על מכסה/קצב',
+  unreachable:'⚠️ אין חיבור ל-Google',
+  service_error:'⚠️ שגיאת שירות'
+ };
+ const checked=check.checked_at?new Date(check.checked_at).toLocaleString():'';
+ return `${labels[check.status]||'⚠️ סטטוס לא ידוע'}${check.detail?' — '+check.detail:''}`+
+  `${checked?' · נבדק '+checked:''} · ${check.elapsed_seconds}s`;
+}
+async function checkAIKey(id){
+ const msg=document.getElementById('aiKeyMsg');
+ try{
+  const r=await api('/api/ai_keys/check',{id});
+  if(r.error)throw Error(r.error);
+  aiKeyChecks[r.result.id]=r.result;renderAIKeyList();
+ }catch(e){msg.textContent='בדיקת החיבור נכשלה: '+e.message;}
+}
+async function loadAIModels(id){
+ const msg=document.getElementById('aiKeyMsg');
+ try{
+  const r=await api('/api/ai_keys/models',{id});
+  if(r.error)throw Error(r.error);
+  aiModelCatalog[id]=r.models;
+  renderAIKeyList();
+  msg.textContent=`נטענו ${r.models.length} מודלים שתומכים ביצירת תוכן עבור ${r.name}.`;
+ }catch(e){msg.textContent='טעינת רשימת המודלים נכשלה: '+e.message;}
+}
+async function saveAIKeyModel(id,model){
+ const msg=document.getElementById('aiKeyMsg');
+ try{
+  const r=await api('/api/ai_keys/model',{id,model});
+  if(r.error)throw Error(r.error);
+  const key=aiKeyList.find(item=>item.id===id);
+  if(key)key.model=r.key.model;
+  delete aiKeyChecks[id];
+  renderAIKeyList();
+  msg.textContent=`המודל ${r.key.model} נשמר עבור המפתח ${r.key.name}; בודק גישה...`;
+  await checkAIKey(id);
+ }catch(e){msg.textContent='שמירת המודל נכשלה: '+e.message;await loadAIKeys();}
+}
+async function checkAllAIKeys(){
+ const btn=document.getElementById('aiKeysCheckAll'),msg=document.getElementById('aiKeyMsg');
+ btn.disabled=true;btn.textContent='בודק חיבור...';
+ try{
+  const r=await api('/api/ai_keys/check',{});
+  if(r.error)throw Error(r.error);
+  for(const result of r.results)aiKeyChecks[result.id]=result;
+  renderAIKeyList();
+  const connected=r.results.filter(x=>x.status==='connected').length;
+  msg.textContent=`נבדקו ${r.results.length} מפתחות; ${connected} התחברו בהצלחה. בדיקה זו אינה מוודאת מכסת יצירת תוכן.`;
+ }catch(e){msg.textContent='רענון בדיקת החיבור נכשל: '+e.message;}
+ finally{btn.disabled=false;btn.textContent='🔄 בדוק/רענן חיבור לכל המפתחות';}
+}
+function renderAIKeyList(){
+ const list=document.getElementById('aiKeyList');
+ list.replaceChildren();
+ const keys=aiKeyList;
+ if(!keys.length){list.textContent='לא נשמרו מפתחות עדיין.';return;}
+ for(const key of keys){
+  const row=document.createElement('div');row.style.cssText='margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap';
+  const name=document.createElement('b');name.textContent=key.name;
+  const status=document.createElement('span');status.textContent=aiKeyStatusText(aiKeyChecks[key.id]);
+  status.title=aiKeyChecks[key.id]?aiKeyChecks[key.id].detail:'';
+  const modelSelect=document.createElement('select');
+  const models=aiModelCatalog[key.id]||[];
+  const selectedAvailable=models.some(model=>model.id===key.model);
+  const selectedOption=document.createElement('option');
+  selectedOption.value=key.model;
+  selectedOption.textContent=selectedAvailable?key.model:`${key.model} (לא נטען/לא זמין)`;
+  modelSelect.appendChild(selectedOption);
+  for(const model of models){
+   if(model.id===key.model)continue;
+   const option=document.createElement('option');
+   option.value=model.id;
+   option.textContent=`${model.display_name} — ${model.id}`;
+   option.title=model.description||'';
+   modelSelect.appendChild(option);
+  }
+  modelSelect.value=key.model;
+  modelSelect.disabled=!models.length;
+  modelSelect.title=models.length
+   ? 'המודל שבו ישתמש מפתח זה בתיקון AI'
+   : 'לחץ על „טען מודלים” כדי לקבל את המודלים הזמינים למפתח';
+  modelSelect.onchange=()=>saveAIKeyModel(key.id,modelSelect.value);
+  const test=document.createElement('button');test.className='mini';test.textContent='בדוק חיבור';
+  test.onclick=()=>checkAIKey(key.id);
+  const refreshModels=document.createElement('button');refreshModels.className='mini';
+  refreshModels.textContent='טען מודלים';
+  refreshModels.onclick=()=>loadAIModels(key.id);
+  const remove=document.createElement('button');remove.className='mini';remove.textContent='הסר';
+  remove.onclick=()=>removeAIKey(key.id);
+  row.append(name,modelSelect,refreshModels,status,test,remove);list.appendChild(row);
+ }
+}
+let aiKeyList=[];
+let aiModelCatalog=Object.create(null);
+async function loadAIKeys(){try{const r=await api('/api/ai_keys');
+ if(r.error)throw Error(r.error);
+ aiKeyList=r.keys;
+ const currentIds=new Set(aiKeyList.map(key=>key.id));
+ for(const id of Object.keys(aiKeyChecks))if(!currentIds.has(id))delete aiKeyChecks[id];
+ for(const id of Object.keys(aiModelCatalog))if(!currentIds.has(id))delete aiModelCatalog[id];
+ renderAIKeyList();
+ }catch(e){document.getElementById('aiKeyMsg').textContent='שגיאה בטעינת המפתחות: '+e.message;}}
+async function addAIKey(){const name=document.getElementById('aiKeyName').value.trim();
+ const key=document.getElementById('aiKeyValue').value.trim(),msg=document.getElementById('aiKeyMsg');
+ if(!name||!key){msg.textContent='צריך למלא שם ומפתח API.';return;}
+ try{const r=await api('/api/ai_keys/add',{name:name,key:key});
+ if(r.error)throw Error(r.error);
+ document.getElementById('aiKeyName').value=''; document.getElementById('aiKeyValue').value='';
+ msg.textContent='המפתח נשמר בהצפנה במחשב. לחץ על „בדוק חיבור” כדי לבדוק אותו מול Google.';
+ await loadAIKeys();
+ }catch(e){msg.textContent='לא ניתן לשמור את המפתח: '+e.message;}}
+async function removeAIKey(id){if(!confirm('להסיר את מפתח ה-API הזה?'))return;
+ try{const r=await api('/api/ai_keys/remove',{id:id});
+ if(r.error)throw Error(r.error);
+ await loadAIKeys();}catch(e){alert('לא ניתן להסיר את המפתח: '+e.message);}}
+
 /* ---------- תמלול חי ---------- */
 function setUploadLock(on){document.getElementById('drop').classList.toggle('disabled',on);
  document.getElementById('btnGo').disabled=on;}
 async function transcribe(){if(!chosenFiles.length){alert('בחר קבצים קודם');return;}
  const btn=document.getElementById('btnGo');setUploadLock(true);btn.textContent='מתמלל...';
+ document.getElementById('modelUsed').textContent='מזהה מודל...';
  lastLines.lines=[];const linesDiv=document.getElementById('lines');
+ document.getElementById('aiReview').style.display='none';aiCorrections=[];
  linesDiv.innerHTML='';linesDiv.dataset.lastSrc='';
  document.getElementById('resultsCard').style.display='none';
  document.getElementById('scanProg').style.display='block';
@@ -1277,9 +1617,12 @@ async function transcribe(){if(!chosenFiles.length){alert('בחר קבצים ק�
    fix:document.getElementById('fixMode').checked});
   while(true){
    const s=await api('/api/transcribe_status',{job:start.job,from:lastLines.lines.length});
-   if(s.model)document.getElementById('modelUsed').textContent='מתמלל עם: '+
-    (s.model==='__base__'?'מודל הבסיס':s.model==='__general__'?'המודל הכללי':
-     s.model==='__typed__'?'מודל הטקסט המוקלד':'המודל האישי של '+s.model);
+   if(s.models_used&&s.models_used.length){
+    const names=s.models_used.map(model=>model==='__base__'?'מודל הבסיס':
+     model==='__general__'?'המודל הכללי':
+     model==='__typed__'?'מודל הטקסט המוקלד':'המודל האישי של '+model);
+    document.getElementById('modelUsed').textContent='בפועל: '+names.join(' + ');
+   }
    if(s.lines&&s.lines.length){const off=lastLines.lines.length;
     s.lines.forEach(l=>l.orig=l.text);  /* שמירת המקור ללמידת תיקונים */
     lastLines.lines.push(...s.lines);appendLines('lines',s.lines,off);
@@ -1291,10 +1634,13 @@ async function transcribe(){if(!chosenFiles.length){alert('בחר קבצים ק�
     (s.pages_total>1?('עמוד '+Math.min(s.pages_done+1,s.pages_total)+'/'+s.pages_total+' · '):'')+
     (s.cur||'')+' · '+lastLines.lines.length+' שורות עד כה';
    if(s.done||s.error){
+    if(s.error&&(!s.models_used||!s.models_used.length))
+     document.getElementById('modelUsed').textContent='לא נבחר מודל';
     if(s.suggs)for(const k in s.suggs)attachSugg('lines',+k,s.suggs[k]);
     if(s.error)alert(s.error);break;}
    await new Promise(r=>setTimeout(r,700));}
- }catch(e){alert('שגיאה: '+e);}
+ }catch(e){document.getElementById('modelUsed').textContent='התמלול נכשל';
+  alert('שגיאה: '+e);}
  document.getElementById('scanProg').style.display='none';
  setUploadLock(false);btn.textContent='🚀 תמלל הכול';
  chosenFiles=[];document.getElementById('fileList').textContent='';
@@ -1554,6 +1900,7 @@ async function importModel(){const n=document.getElementById('modelName').value.
  const r=await api('/api/import_model',{file:b64,name:n});
  document.getElementById('modelMsg').textContent=r.msg;refreshAll();}
 refreshAll();pollTrain();
+loadAIKeys();
 </script></body></html>"""
 
 
@@ -1566,6 +1913,7 @@ class Handler(BaseHTTPRequestHandler):
         data = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, must-revalidate")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -1588,10 +1936,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if urlparse(self.path).path == "/":
             self._bytes(HTML.encode(), "text/html; charset=utf-8")
+        elif urlparse(self.path).path == "/favicon.ico":
+            with open(os.path.join(BUNDLE, "icon.ico"), "rb") as f:
+                self._bytes(f.read(), "image/x-icon")
         elif self.path == "/api/writers":
             self._json(list_writers())
         elif self.path == "/api/train_status":
             self._json(train_status())
+        elif self.path == "/api/ai_keys":
+            self._json({"keys": ai_correction.list_keys()})
         elif self.path == "/api/templates/list":
             self._json(list_templates())
         elif self.path == "/api/config":
@@ -1667,17 +2020,47 @@ class Handler(BaseHTTPRequestHandler):
                 frm = int(body.get("from", 0))
                 with _jobs_lock:
                     new_lines = job["lines"][frm:]
+                    models_used = list(job["models_used"])
                 self._json({"pages_total": job["pages_total"],
                             "pages_done": job["pages_done"], "cur": job["cur"],
                             "progress": job.get("progress", 0),
                             "done": job["done"], "error": job["error"],
-                            "model": job["model"], "lines": new_lines,
+                            "model": job["model"], "models_used": models_used,
+                            "lines": new_lines,
                             "suggs": job.get("suggs") if job["done"] else None})
 
             elif self.path == "/api/save":
                 saved, quar, dups = save_lines(body["writer"], body["lines"])
                 postfix.refresh_vocab()
                 self._json({"saved": saved, "quarantined": quar, "dups": dups})
+
+            elif self.path == "/api/ai_keys/add":
+                keys = ai_correction.add_key(body.get("name"), body.get("key"))
+                self._json({"ok": True, "keys": keys})
+
+            elif self.path == "/api/ai_keys/remove":
+                keys = ai_correction.remove_key(body.get("id", ""))
+                self._json({"ok": True, "keys": keys})
+
+            elif self.path == "/api/ai_keys/check":
+                key_id = body.get("id")
+                if key_id:
+                    self._json({"result": ai_correction.check_key(key_id)})
+                else:
+                    self._json({"results": ai_correction.check_all_keys()})
+
+            elif self.path == "/api/ai_keys/models":
+                self._json(ai_correction.list_available_models(
+                    body.get("id", "")))
+
+            elif self.path == "/api/ai_keys/model":
+                key = ai_correction.set_key_model(
+                    body.get("id", ""), body.get("model", ""))
+                self._json({"ok": True, "key": key})
+
+            elif self.path == "/api/ai_correct":
+                self._json(ai_correction.correct_lines(
+                    body.get("lines"), body.get("batch_size", ai_correction.BATCH_SIZE)))
 
             elif self.path == "/api/save_fixes":
                 # מודל התיקונים: הפקת זוגות (שגוי->נכון) מהעריכות של המשתמש
@@ -1859,46 +2242,114 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": str(e)}, 500)
 
 
-def _open_window(url):
-    for path in (
-        os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
-        os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
-        os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
-        os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
-    ):
-        if os.path.exists(path):
-            subprocess.Popen([path, f"--app={url}", "--window-size=1220,880"])
-            return
-    webbrowser.open(url)
+class LocalHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = False
 
 
-def _port_free(port):
-    """בדיקת פורט אמיתית: אם אפשר להתחבר אליו — הוא תפוס.
-    (ב-Windows קשירה כפולה לא זורקת שגיאה בגלל SO_REUSEADDR, ולכן חובה לבדוק כך.)"""
-    import socket
-    with socket.socket() as s:
-        s.settimeout(0.3)
-        return s.connect_ex(("127.0.0.1", port)) != 0
+def _create_server():
+    """Use the preferred local port, then any OS-assigned free port."""
+    for candidate in (*range(PORT, PORT + 10), 0):
+        try:
+            return LocalHTTPServer(("127.0.0.1", candidate), Handler)
+        except OSError:
+            continue
+    raise OSError("לא ניתן לפתוח שרת מקומי בפורט פנוי")
+
+
+def _show_startup_error(message):
+    if os.name == "nt":
+        ctypes.windll.user32.MessageBoxW(None, message, "כתב-יד AI", 0x10)
+
+
+def _load_window_size():
+    try:
+        with open(WINDOW_SIZE_PATH, encoding="utf-8") as f:
+            size = json.load(f)
+        width, height = int(size["width"]), int(size["height"])
+        if not (800 <= width <= 10000 and 600 <= height <= 6000):
+            raise ValueError("saved window size is outside the allowed range")
+        return width, height
+    except FileNotFoundError:
+        return DEFAULT_WINDOW_SIZE
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            "Could not load saved window size from %s: %s",
+            WINDOW_SIZE_PATH, exc)
+        return DEFAULT_WINDOW_SIZE
+
+
+def _save_window_size(width, height):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    temporary_path = WINDOW_SIZE_PATH + ".tmp"
+    with open(temporary_path, "w", encoding="utf-8") as f:
+        json.dump({"width": int(width), "height": int(height)}, f)
+    os.replace(temporary_path, WINDOW_SIZE_PATH)
+
+
+def _find_app_browser():
+    candidates = [
+        shutil.which("msedge"),
+        shutil.which("msedge.exe"),
+        shutil.which("chrome"),
+        shutil.which("chrome.exe"),
+    ]
+    for root in (os.environ.get("PROGRAMFILES"),
+                 os.environ.get("PROGRAMFILES(X86)"),
+                 os.environ.get("LOCALAPPDATA")):
+        if not root:
+            continue
+        candidates.extend((
+            os.path.join(root, "Microsoft", "Edge", "Application", "msedge.exe"),
+            os.path.join(root, "Google", "Chrome", "Application", "chrome.exe"),
+        ))
+    return next((path for path in candidates if path and os.path.isfile(path)), None)
 
 
 def main():
+    logger = logging.getLogger("ktavyadai.startup")
     os.makedirs(WRITERS_DIR, exist_ok=True)
-    server = None
-    port = PORT
-    for port in range(PORT, PORT + 10):  # אם הפורט תפוס (מופע נוסף) — עוברים לבא
-        if not _port_free(port):
-            continue
+    try:
+        server = _create_server()
+    except OSError as exc:
+        _show_startup_error(f"לא ניתן להפעיל שרת מקומי.\n\n{exc}")
+        raise
+    url = f"http://127.0.0.1:{server.server_port}"
+    logger.info("local HTTP server listening at %s", url)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
         try:
-            server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-            break
-        except OSError:
-            continue
-    if server is None:
-        return
-    url = f"http://127.0.0.1:{port}"
-    print(f"התוכנה פועלת (שרת מקומי פנימי): {url}")
-    threading.Timer(1.0, lambda: _open_window(url)).start()
-    server.serve_forever()
+            webview = importlib.import_module("webview")
+        except ModuleNotFoundError as exc:
+            if exc.name != "webview":
+                raise
+            browser = _find_app_browser()
+            if browser is None:
+                raise RuntimeError(
+                    "לא נמצא Microsoft Edge או Google Chrome לפתיחת חלון "
+                    "התוכנה. יש להתקין אחד מהם ולנסות שוב.")
+            width, height = _load_window_size()
+            logger.info("opening standalone browser app window with %s at %dx%d",
+                        browser, width, height)
+            subprocess.Popen(
+                [browser, f"--app={url}", f"--window-size={width},{height}"])
+            threading.Event().wait()
+        else:
+            width, height = _load_window_size()
+            window = webview.create_window(
+                f"כתב-יד AI {VERSION}", url, width=width, height=height,
+                min_size=(800, 600))
+            if window is None:
+                raise RuntimeError("לא ניתן ליצור את חלון התוכנה")
+            window.events.resized += _save_window_size
+            logger.info("opening embedded interface at %dx%d", width, height)
+            webview.start(gui="qt", icon=os.path.join(BUNDLE, "icon.ico"))
+    except Exception as exc:
+        _show_startup_error(f"לא ניתן להפעיל את הממשק המקומי.\n\n{exc}")
+        raise
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 if __name__ == "__main__":

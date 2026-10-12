@@ -1,3 +1,10 @@
+# Application runtime dependencies
 torch
 numpy
 pillow
+pypdfium2
+certifi
+truststore
+
+# Build dependency
+pyinstaller
