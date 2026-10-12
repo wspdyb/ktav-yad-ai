@@ -1566,7 +1566,8 @@ async function loadAIModels(id){
   if(r.error)throw Error(r.error);
   aiModelCatalog[id]=r.models;
   renderAIKeyList();
-  msg.textContent=`נטענו ${r.models.length} מודלים שתומכים ביצירת תוכן עבור ${r.name}.`;
+  msg.textContent=`Google מציג ${r.models.length} מודלים שתומכים ביצירת תוכן עבור ${r.name}. `+
+   'הרשימה אינה מבטיחה שהמודל יענה כרגע; שגיאת 503 בדרך כלל מציינת עומס זמני.';
  }catch(e){msg.textContent='טעינת רשימת המודלים נכשלה: '+e.message;}
 }
 async function saveAIKeyModel(id,model){
@@ -1610,7 +1611,9 @@ function renderAIKeyList(){
   const selectedAvailable=models.some(model=>model.id===key.model);
   const selectedOption=document.createElement('option');
   selectedOption.value=key.model;
-  selectedOption.textContent=selectedAvailable?key.model:`${key.model} (לא נטען/לא זמין)`;
+  selectedOption.textContent=selectedAvailable
+   ? `${key.model} (מופיע ברשימת Google)`
+   : `${key.model} (ברירת מחדל; טרם אומת מול Google)`;
   modelSelect.appendChild(selectedOption);
   for(const model of models){
    if(model.id===key.model)continue;

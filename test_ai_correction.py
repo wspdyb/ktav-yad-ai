@@ -36,7 +36,7 @@ class AICorrectionTests(unittest.TestCase):
         self.assertNotIn("secret-api-key", json.dumps(stored))
         self.assertEqual(keys, [{
             "id": stored["id"], "name": "work",
-            "model": ai_correction.MODEL,
+            "model": ai_correction.DEFAULT_MODEL,
         }])
         self.assertEqual(ai_correction.list_keys(), keys)
         self.assertEqual(ai_correction.remove_key(keys[0]["id"]), [])

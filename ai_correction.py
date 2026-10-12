@@ -15,7 +15,9 @@ from ctypes import wintypes
 
 from paths import DATA_DIR
 
-MODEL = "gemini-2.5-flash"
+# Default only for newly added keys and legacy key records without a saved model.
+# AI requests use each key's saved model selection.
+DEFAULT_MODEL = "gemini-2.5-flash"
 BATCH_SIZE = 8
 ALLOWED_BATCH_SIZES = (1, 2, 4, 8)
 REQUEST_TIMEOUT = 90
@@ -87,7 +89,7 @@ def _read_keys():
                            for field in ("id", "name", "encrypted"))
                 or ("model" in item and not isinstance(item["model"], str))):
             raise AIStudioError("רשומת מפתח AI Studio פגומה; יש לבדוק את תיקיית data")
-        item.setdefault("model", MODEL)
+        item.setdefault("model", DEFAULT_MODEL)
     return store["keys"]
 
 
@@ -124,7 +126,7 @@ def add_key(name, api_key):
             raise AIStudioError("כבר קיים מפתח בשם הזה")
         encrypted = base64.b64encode(_crypt(api_key.encode("utf-8"), True)).decode("ascii")
         keys.append({"id": uuid.uuid4().hex, "name": name,
-                     "encrypted": encrypted, "model": MODEL})
+                     "encrypted": encrypted, "model": DEFAULT_MODEL})
         _write_keys(keys)
         return [{"id": item["id"], "name": item["name"],
                  "model": item["model"]} for item in keys]
@@ -190,7 +192,7 @@ def _error_payload(exc):
         category = "rejected"
     else:
         category = "service_error"
-    return category, message
+    return category, _translate_google_error(message, exc.code, text)
 
 
 def _list_models(api_key):
@@ -357,14 +359,27 @@ def _api_error_message(payload, status):
             "NOT_FOUND" in error_text or "NOT SUPPORTED" in error_text):
         raise _RotateKey(
             "המודל שנבחר אינו זמין למפתח הזה; יש לרענן את רשימת המודלים")
-    raise AIStudioError(f"Google AI Studio החזיר שגיאה ({status}): {message}")
+    translated = _translate_google_error(message, status, error_text)
+    raise AIStudioError(f"Google AI Studio: {translated}")
 
 
 class _RotateKey(AIStudioError):
     pass
 
 
-def _request_gemini(api_key, lines, model=MODEL):
+def _translate_google_error(message, status, error_text=""):
+    normalized = f"{status} {error_text} {message}".casefold()
+    if (status == 503 or "high demand" in normalized
+            or "temporarily unavailable" in normalized
+            or "service unavailable" in normalized):
+        return (
+            "שירות Google AI Studio עמוס כרגע (שגיאה 503). "
+            "זו בדרך כלל תקלה זמנית, ולא בהכרח בעיה במפתח או בזמינות המודל. "
+            "נסה שוב בעוד כמה דקות.")
+    return message
+
+
+def _request_gemini(api_key, lines, model=DEFAULT_MODEL):
     parts = [{
         "text": (
             "תקן תמלול OCR בעברית על פי התמונות המצורפות. לכל תמונה מצורפים "
