@@ -5,17 +5,8 @@ echo ============================================
 echo Building portable single-file EXE
 echo User data will be stored beside the EXE in data\ and models\
 echo ============================================
-echo Select how the application should display its interface:
-echo   E - Open a standalone Edge/Chrome app window (recommended; no browser bundled)
-echo   I - Use the embedded Qt WebEngine window (installs additional packages)
-choice /C EI /N /D E /T 10 /M "Choose [E/I] (default E)"
-if errorlevel 2 (
-  set "KTAVYADAI_EMBEDDED_BROWSER=1"
-  echo Building with embedded Qt WebEngine.
-) else (
-  set "KTAVYADAI_EMBEDDED_BROWSER=0"
-  echo Building with a standalone Edge/Chrome app window.
-)
+set "KTAVYADAI_EMBEDDED_BROWSER=1"
+echo Building with an embedded application window; no external browser is required.
 if not exist "icon.ico" (
   echo ERROR: Required application icon is missing: icon.ico.
   exit /b 1
@@ -58,7 +49,7 @@ venv\Scripts\python.exe -m pip install --disable-pip-version-check -r requiremen
 if errorlevel 1 goto :dependency_error
 
 if "%KTAVYADAI_EMBEDDED_BROWSER%"=="1" (
-  echo Installing optional embedded browser packages...
+  echo Installing embedded application-window packages...
   venv\Scripts\python.exe -m pip install --disable-pip-version-check "pywebview[qt]"
   if errorlevel 1 goto :dependency_error
 )
@@ -75,15 +66,46 @@ if not exist "release\KtavYadAI.exe" (
   exit /b 1
 )
 
-echo.
-echo Done: release\KtavYadAI.exe
-echo Running startup diagnostic with a log...
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$exe = (Resolve-Path 'release\KtavYadAI.exe').Path; $timer = [Diagnostics.Stopwatch]::StartNew(); $p = Start-Process -FilePath $exe -ArgumentList '--diagnose-startup' -WorkingDirectory (Get-Location).Path -Wait -PassThru; $timer.Stop(); Add-Content -Path 'release\data\startup.log' -Value ('build_process_total_seconds={0:N2}' -f $timer.Elapsed.TotalSeconds); exit $p.ExitCode"
-if errorlevel 1 (
-  echo ERROR: Startup diagnostic failed. See release\data\startup.log
+if not exist "portable" mkdir "portable"
+echo Building the standalone OCRHE command-line executable...
+venv\Scripts\pyinstaller.exe --noconfirm --clean --distpath portable --workpath build\ocrhe OCRHE.spec
+if errorlevel 1 exit /b 1
+if not exist "portable\OCRHE.exe" (
+  echo ERROR: PyInstaller reported success but portable\OCRHE.exe was not created.
   exit /b 1
 )
-echo Startup diagnostic passed. Log: release\data\startup.log
+copy /Y "release\KtavYadAI.exe" "portable\KtavYadAI.exe" >nul
+if errorlevel 1 (
+  echo ERROR: Could not copy the GUI executable into portable.
+  exit /b 1
+)
+if not exist "portable\data" if exist "release\data" (
+  xcopy "release\data" "portable\data" /E /I /H /Y >nul
+  if errorlevel 1 exit /b 1
+)
+if not exist "portable\models" if exist "release\models" (
+  xcopy "release\models" "portable\models" /E /I /H /Y >nul
+  if errorlevel 1 exit /b 1
+)
+
+echo.
+echo Done:
+echo   release\KtavYadAI.exe       Official GUI release build
+echo   portable\KtavYadAI.exe      Portable GUI executable
+echo   portable\OCRHE.exe          Portable command-line executable
+echo Both portable executables share portable\data and portable\models.
+portable\OCRHE.exe --help >nul
+if errorlevel 1 (
+  echo ERROR: OCRHE command-line help smoke test failed.
+  exit /b 1
+)
+echo Running startup diagnostic with a log...
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$exe = (Resolve-Path 'portable\KtavYadAI.exe').Path; $timer = [Diagnostics.Stopwatch]::StartNew(); $p = Start-Process -FilePath $exe -ArgumentList '--diagnose-startup' -WorkingDirectory (Get-Location).Path -Wait -PassThru; $timer.Stop(); Add-Content -Path 'portable\data\startup.log' -Value ('build_process_total_seconds={0:N2}' -f $timer.Elapsed.TotalSeconds); exit $p.ExitCode"
+if errorlevel 1 (
+  echo ERROR: Startup diagnostic failed. See portable\data\startup.log
+  exit /b 1
+)
+echo Startup diagnostic passed. Log: portable\data\startup.log
 exit /b 0
 
 :python_missing

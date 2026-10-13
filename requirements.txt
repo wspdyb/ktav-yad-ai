@@ -5,6 +5,7 @@ pillow
 pypdfium2
 certifi
 truststore
+keyring
 
 # Build dependency
 pyinstaller

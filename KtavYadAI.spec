@@ -16,8 +16,12 @@ datas = [
     ('icon.ico', '.'),
 ]
 binaries = []
-hiddenimports = ['paths', 'charset', 'model', 'synth', 'dataset', 'train', 'segment', 'infer', 'make_template', 'postfix', 'gates', 'fixes', 'ai_correction', 'app']
-packages = ['torch', 'pypdfium2', 'certifi', 'truststore']
+hiddenimports = [
+    'paths', 'charset', 'model', 'synth', 'dataset', 'train', 'segment',
+    'infer', 'make_template', 'postfix', 'gates', 'fixes', 'records',
+    'ai_correction', 'app',
+]
+packages = ['torch', 'pypdfium2', 'certifi', 'truststore', 'keyring']
 if embedded_browser:
     packages.append('webview')
 for package in packages:

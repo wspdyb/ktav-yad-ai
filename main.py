@@ -128,17 +128,19 @@ def run():
             writer = sys.argv[i + 1] if i + 1 < len(sys.argv) else None
             if writer:
                 import train
+                resume = "--fresh" not in sys.argv
                 if "--personal-only" in sys.argv or "--general-only" in sys.argv:
                     target = ("__general__" if "--general-only" in sys.argv else writer)
                     train._write_pid()
                     try:
-                        train.train(target, 2000, 24, 1e-4, resume=True)
+                        train.train(target, 2000, 24, 1e-4, resume=resume)
                     except SystemExit:
                         pass
                     finally:
                         train._clear_pid()
+                        train._clear_stop_request()
                 else:
-                    train.chain(writer)
+                    train.chain(writer, resume=resume)
             return 0
 
         phase = time.perf_counter()

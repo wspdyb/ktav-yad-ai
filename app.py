@@ -43,6 +43,7 @@ import ai_correction
 import postfix
 import gates
 import fixes
+import records
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -53,6 +54,7 @@ WINDOW_SIZE_PATH = os.path.join(DATA_DIR, "window_size.json")
 DEFAULT_WINDOW_SIZE = (1220, 880)
 PORT = 8765
 PID_FILE = os.path.join(MODELS, "train.pid")
+TRAIN_STOP_FILE = os.path.join(MODELS, "train.stop")
 
 _state = {"models": {}}
 _jobs = {}
@@ -194,6 +196,16 @@ def save_lines(writer, lines):
 
 # ---------------------------------------------------------------- אימון
 def _pid_alive(pid):
+    if os.name != "nt":
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
     SYNCHRONIZE = 0x00100000
     h = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
     if not h:
@@ -220,15 +232,18 @@ def _train_pid():
 
 def training_running():
     pid = _train_pid()
-    if pid is not None and _pid_alive(pid):
+    if pid is None:
+        return False
+    if _pid_alive(pid):
         return True
-    # גיבוי: יומן אימון שעודכן בשש הדקות האחרונות = אימון פעיל (גם חיצוני;
-    # רישום ליומן קורה כל ~50 צעדים, שיכולים לקחת כמה דקות במעבד עמוס)
-    _, m = _latest_log()
-    return bool(m) and (time.time() - m) < 360
+    try:
+        os.remove(PID_FILE)
+    except OSError:
+        pass
+    return False
 
 
-def start_training(writer, scope="both"):
+def start_training(writer, scope="both", resume=True):
     """מפעיל אימון עצמאי לפי היקף: both (אישי+כללי) / personal / general.
     התהליך מנותק מהתוכנה וממשיך גם אם סוגרים אותה."""
     if training_running():
@@ -238,22 +253,33 @@ def start_training(writer, scope="both"):
             "general": ["train_general.log"]}.get(scope, [])
     for f in logs:
         open(os.path.join(MODELS, f), "w", encoding="utf-8").close()
-    flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    try:
+        os.remove(TRAIN_STOP_FILE)
+    except OSError:
+        pass
+    flags = (subprocess.DETACHED_PROCESS |
+             subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0
+    run_mode = "--resume" if resume else "--fresh"
     if FROZEN:
-        cmd = [sys.executable, "--train", writer or "-"]
+        cmd = [sys.executable, "--train", writer or "-", run_mode]
         if scope == "personal":
             cmd.append("--personal-only")
         elif scope == "general":
             cmd.append("--general-only")
     else:
         if scope == "general":
-            cmd = [sys.executable, os.path.join(HERE, "train.py"), "general", "--resume"]
+            cmd = [sys.executable, os.path.join(HERE, "train.py"), "general", run_mode]
         elif scope == "personal":
-            cmd = [sys.executable, os.path.join(HERE, "train.py"), "writer", writer, "--resume"]
+            cmd = [sys.executable, os.path.join(HERE, "train.py"), "writer", writer, run_mode]
         else:
-            cmd = [sys.executable, os.path.join(HERE, "train.py"), "chain", writer]
-    subprocess.Popen(cmd, cwd=HERE, creationflags=flags, close_fds=True,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            cmd = [sys.executable, os.path.join(HERE, "train.py"), "chain", writer, run_mode]
+    process_kwargs = {"creationflags": flags} if os.name == "nt" else {
+        "start_new_session": True}
+    process = subprocess.Popen(
+        cmd, cwd=HERE, close_fds=True, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, **process_kwargs)
+    with open(PID_FILE, "w", encoding="ascii") as f:
+        f.write(str(process.pid))
     what = {"both": "אישי + כללי", "personal": "אישי בלבד",
             "general": "הכללי בלבד"}.get(scope, scope)
     return True, f"האימון החל ({what}). רץ ברקע — אפשר לסגור את התוכנה."
@@ -364,7 +390,7 @@ def delete_writer(writer):
     shutil.rmtree(wdir, ignore_errors=True)
     removed = ["נתוני האימון"]
     model_f = os.path.join(MODELS, f"writer_{writer}.pt")
-    for f in (model_f, model_f + ".last",
+    for f in (model_f, model_f + ".last", model_f + ".last.previous",
               os.path.join(MODELS, f"{writer}.meta.json"),
               os.path.join(MODELS, f"train_{writer}.log")):
         try:
@@ -388,15 +414,11 @@ def delete_writer(writer):
 
 def stop_training():
     pid = _train_pid()
-    if pid and _pid_alive(pid):
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                       capture_output=True)
-        try:
-            os.remove(PID_FILE)
-        except OSError:
-            pass
-        return True
-    return False
+    if not pid or not _pid_alive(pid):
+        return False
+    with open(TRAIN_STOP_FILE, "w", encoding="ascii") as f:
+        f.write("stop")
+    return True
 
 
 def _latest_log():
@@ -475,7 +497,13 @@ def _run_transcribe_job(job_id, files, page_mode, writer, prefer, use_fix):
             if page_mode:
                 tmp = os.path.join(UPLOADS_DIR, f"_job{job_id}.png")
                 pil.save(tmp)
-                items = segment_page_ex(tmp)
+                try:
+                    items = segment_page_ex(tmp)
+                finally:
+                    try:
+                        os.remove(tmp)
+                    except FileNotFoundError:
+                        pass
             else:
                 items = [(pil, None)]
             imgs = [im for im, _ in items]
@@ -1048,15 +1076,47 @@ HTML = r"""<!DOCTYPE html>
     <button class="mini" type="button" onclick="invertAISelection()">הפוך בחירה</button>
     <button class="mini" type="button" onclick="setAISelection(false)">נקה בחירה</button>
    </span>
-   <label title="מספר חיתוכי השורות בכל בקשת רשת; יותר שורות בבקשה מפחית בקשות נפרדות">
-    שורות לבקשה:
-    <select id="aiBatchSize">
-     <option value="1">1</option>
-     <option value="2">2</option>
-     <option value="4">4</option>
-     <option value="8" selected>8</option>
+   <label>מספרי שורות:
+    <input id="aiLineNumbers" type="text" placeholder="למשל 1,3-5"
+     style="width:110px">
+   </label>
+   <button class="mini" type="button" onclick="selectAILinesByNumber()">סמן לפי מספרים</button>
+   <label>מפתח API:
+    <select id="aiKeyChoice" title="בחר מפתח שמור או השתמש בסבב האוטומטי">
+     <option value="">בחירה אוטומטית</option>
     </select>
    </label>
+   <label title="מספר חיתוכי השורות בכל בקשת רשת; יותר שורות בבקשה מפחית בקשות נפרדות">
+    שורות לבקשה:
+    <input id="aiBatchSize" type="number" min="1" max="16" value="8"
+     style="width:70px" onchange="saveAISettings()">
+   </label>
+   <details style="display:inline-block">
+    <summary style="cursor:pointer">פרמטרים מתקדמים</summary>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px">
+     <label>Temperature
+      <input id="aiTemperature" type="number" min="0" max="2" step="0.1"
+       value="0" style="width:72px" onchange="saveAISettings()">
+     </label>
+     <label>Top-P
+      <input id="aiTopP" type="number" min="0" max="1" step="0.01"
+       style="width:72px" onchange="saveAISettings()">
+     </label>
+     <label>Top-K
+      <input id="aiTopK" type="number" min="1" max="1000" step="1"
+       style="width:72px" onchange="saveAISettings()">
+     </label>
+     <label>טוקנים מרביים
+      <input id="aiMaxOutputTokens" type="number" min="1" max="65536" step="1"
+       style="width:92px" onchange="saveAISettings()">
+     </label>
+     <label>פסק זמן (שניות)
+      <input id="aiRequestTimeout" type="number" min="1" max="300" step="1"
+       value="90" style="width:76px" onchange="saveAISettings()">
+     </label>
+     <button class="mini" type="button" onclick="resetAISettings()">אפס לברירות מחדל</button>
+    </div>
+   </details>
    <button class="btn" style="background:#7352a3" id="aiCorrectBtn" onclick="aiCorrect()">✨ הצע תיקון AI</button>
    <span id="aiSelectionInfo" class="muted"></span>
    <button class="btn" style="background:#b8860b" onclick="applyAllSuggs()">💡 החל את כל ההצעות</button>
@@ -1117,7 +1177,8 @@ HTML = r"""<!DOCTYPE html>
      <option value="personal">רק המודל האישי</option>
      <option value="general">רק המודל הכללי (הזרמת הנתונים הקיימים אליו)</option>
     </select>
-    <button class="btn green" onclick="train()">🎓 אמן עכשיו</button>
+    <button class="btn green" onclick="train(undefined,true)">&#1492;&#1502;&#1513;&#1498; &#1488;&#1497;&#1502;&#1493;&#1503; / &#1488;&#1502;&#1503; &#1495;&#1491;&#1513;</button>
+    <button class="btn" onclick="train(undefined,false)" title="Start over from the base/general model; the interrupted checkpoint is kept as a backup">&#1488;&#1514;&#1495;&#1500; &#1488;&#1497;&#1502;&#1493;&#1503; &#1502;&#1495;&#1491;&#1513;</button>
     <button class="btn red" onclick="stopTrain()">⏹ עצור אימון</button>
    </div>
    <div class="muted" style="margin-top:8px">מומלץ אימון מלא: המודל הכללי לומד מכל הכותבים יחד,
@@ -1139,6 +1200,20 @@ HTML = r"""<!DOCTYPE html>
    <button class="btn red" style="margin-right:18px" onclick="deleteWriter()"
     title="מוחק את הכותב הנבחר למעלה: נתוני האימון + המודל האישי. בלתי הפיך!">🗑 מחק את הכותב הנבחר</button>
    <span id="delWriterMsg" class="muted"></span>
+  </div>
+ </div>
+ <div class="card">
+  <b class="title">🗂️ היסטוריית דוגמאות האימון — צפייה, עריכה ומחיקה</b>
+  <p class="muted">כאן אפשר לתקן תיוג שנשמר לא נכון או להסיר דוגמה. השינוי מתעדכן
+   בקובצי האימון ובאינדקס הכפילויות; הוא לא מוחק ידע שכבר נכנס למשקולות המודל.
+   לאחר תיקון נתונים, הפעל אימון מחדש או שחזר גרסת מודל קודמת.</p>
+  <div><button class="btn" onclick="refreshExamples()">רענן דוגמאות</button>
+   <span id="examplesSummary" class="muted"></span></div>
+  <div id="examplesList"></div>
+  <div style="display:flex;gap:8px;align-items:center;margin-top:10px">
+   <button class="btn" id="examplesPrev" onclick="pageExamples(-1)">הקודם</button>
+   <span id="examplesPage" class="muted"></span>
+   <button class="btn" id="examplesNext" onclick="pageExamples(1)">הבא</button>
   </div>
  </div>
  <div class="card" id="quarCard" style="display:none"><b class="title">🛃 הסגר — שורות שממתינות לאישור</b>
@@ -1317,7 +1392,7 @@ async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET'
 function showTab(id,btn){for(const t of ['tabScan','tabTrain','tabTmpl','tabPar','tabFix'])
  document.getElementById(t).style.display=t===id?'block':'none';
  document.querySelectorAll('nav button').forEach(b=>b.classList.remove('active'));
- btn.classList.add('active');}
+ btn.classList.add('active');if(id==='tabTrain')refreshExamples();}
 
 /* ---------- קבצים ---------- */
 const drop=document.getElementById('drop');
@@ -1435,6 +1510,80 @@ function invertAISelection(){
  });
  updateAISelectionControls();
 }
+async function selectAILinesByNumber(){
+ const raw=document.getElementById('aiLineNumbers').value.trim(),requested=new Set();
+ if(!raw){await appAlert('הזן מספרי שורות, למשל 1,3-5.');return;}
+ for(const part of raw.split(',')){
+  const match=part.trim().match(/^(\d+)(?:-(\d+))?$/);
+  if(!match){await appAlert(`בחירת שורות לא תקינה: ${part}`);return;}
+  const start=Number(match[1]),end=Number(match[2]||match[1]);
+  if(start<1||end<start||end>lastLines.lines.length){
+   await appAlert(`מספרי שורות חייבים להיות בין 1 ל-${lastLines.lines.length}.`);return;}
+  for(let number=start;number<=end;number++)requested.add(number);
+ }
+ const inputs=[...document.querySelectorAll('#lines .line .aiRowSelect:not(:disabled)')]
+  .filter(input=>input.closest('.line').style.display!=='none');
+ const available=new Set(inputs.map(input=>Number(input.dataset.aiIndex)+1));
+ const missing=[...requested].filter(number=>!available.has(number));
+ if(missing.length){await appAlert(`השורות ${missing.join(', ')} אינן זמינות לשליחה ל-AI.`);return;}
+ document.getElementById('aiScope').value='manual';
+ for(const input of inputs)
+  input.checked=requested.has(Number(input.dataset.aiIndex)+1);
+ updateAISelectionControls();
+}
+function readAISettings(){
+ const number=(id,optional=false)=>{
+  const value=document.getElementById(id).value.trim();
+  return value===''&&optional?null:Number(value);
+ };
+ return {batch_size:number('aiBatchSize'),temperature:number('aiTemperature'),
+  top_p:number('aiTopP',true),top_k:number('aiTopK',true),
+  max_output_tokens:number('aiMaxOutputTokens',true),
+  request_timeout:number('aiRequestTimeout')};
+}
+async function saveAISettings(showMessage=true){
+ const msg=document.getElementById('aiKeyMsg');
+ try{
+  const settings=readAISettings();
+  const r=await api('/api/ai_settings',settings);
+  if(r.error)throw Error(r.error);
+  if(showMessage)msg.textContent='הגדרות תיקון AI נשמרו ומשותפות לתוכנה ול-CLI.';
+  return settings;
+ }catch(e){
+  msg.textContent='שמירת הגדרות AI נכשלה: '+e.message;
+  return null;
+ }
+}
+async function loadAISettings(){
+ try{
+  const s=await api('/api/ai_settings');
+  if(s.error)throw Error(s.error);
+  document.getElementById('aiBatchSize').value=s.batch_size;
+  document.getElementById('aiTemperature').value=s.temperature;
+  document.getElementById('aiTopP').value=s.top_p==null?'':s.top_p;
+  document.getElementById('aiTopK').value=s.top_k==null?'':s.top_k;
+  document.getElementById('aiMaxOutputTokens').value=
+   s.max_output_tokens==null?'':s.max_output_tokens;
+  document.getElementById('aiRequestTimeout').value=s.request_timeout;
+ }catch(e){document.getElementById('aiKeyMsg').textContent=
+  'שגיאה בטעינת הגדרות AI: '+e.message;}
+}
+async function resetAISettings(){
+ if(!await appConfirm('לאפס את פרמטרי תיקון ה-AI לברירות המחדל?'))return;
+ try{
+  const r=await api('/api/ai_settings/reset',{});
+  if(r.error)throw Error(r.error);
+  const s=r.settings;
+  document.getElementById('aiBatchSize').value=s.batch_size;
+  document.getElementById('aiTemperature').value=s.temperature;
+  document.getElementById('aiTopP').value='';
+  document.getElementById('aiTopK').value='';
+  document.getElementById('aiMaxOutputTokens').value='';
+  document.getElementById('aiRequestTimeout').value=s.request_timeout;
+  document.getElementById('aiKeyMsg').textContent='הגדרות AI אופסו.';
+ }catch(e){document.getElementById('aiKeyMsg').textContent=
+  'איפוס הגדרות AI נכשל: '+e.message;}
+}
 function updateAISelectionControls(){
  const allVisible=getVisibleAILines(false),visible=allVisible.filter(x=>x.aiCrop);
  const pages=[...new Set(visible.map(x=>x.pageKey))];
@@ -1476,9 +1625,11 @@ async function aiCorrect(){
  const btn=document.getElementById('aiCorrectBtn'),msg=document.getElementById('saveMsg');
  btn.disabled=true;msg.textContent=`שולח ${selected.length} חיתוכי שורות ל-Google AI Studio...`;
  try{
+  const settings=await saveAISettings(false);
+  if(!settings)throw Error(document.getElementById('aiKeyMsg').textContent);
   const r=await api('/api/ai_correct',{
    lines:selected.map(x=>({img:x.item.img,text:x.item.text})),
-   batch_size:Number(document.getElementById('aiBatchSize').value)});
+   ...settings,key_id:document.getElementById('aiKeyChoice').value||null});
   if(r.error)throw Error(r.error);
   aiCorrections=(r.corrections||[]).map(c=>({
    ...c,index:selected[c.index].index,lineNumber:selected[c.index].index+1,
@@ -1497,8 +1648,12 @@ function renderAIReview(keys,metrics,warning){
   `בקשה ${i+1}: ${b.line_count} שורות, ${(b.image_bytes/1024).toFixed(1)}KB תמונות, `+
   `${(b.request_bytes/1024).toFixed(1)}KB נשלחו, `+
   `${b.elapsed_seconds}s, ${b.total_tokens==null?'טוקנים לא דווחו':b.total_tokens+' טוקנים'}`).join(' · ');
+ const generation=metrics.generation||{};
  const stats=`${metrics.line_count||0} שורות ב-${metrics.batch_count||0} בקשות; `+
   `זמן כולל ${metrics.elapsed_seconds||0}s; ${usage}. ${batches}. `+
+  `פרמטרים: batch=${metrics.batch_size||'—'}, temperature=${generation.temperature??'—'}, `+
+  `top-p=${generation.top_p??'ברירת מחדל'}, top-k=${generation.top_k??'ברירת מחדל'}, `+
+  `max tokens=${generation.max_output_tokens??'ברירת מחדל'}, timeout=${generation.request_timeout??'—'}s. `+
   `יתרת מכסה אינה מדווחת דרך בקשת התיקון; טוקני הקלט כוללים גם תמונות.`+
   (warning?` ${warning}`:'');
  aiMetricsSummary=stats;
@@ -1538,6 +1693,7 @@ function updateAIReviewStatus(){
   'הוחלו '+applied+' הצעות בטיוטה; '+skipped+' נדחו. ניתן לערוך את השורות לפני שמירה לאימון. '+
   aiMetricsSummary;}
 let aiKeyChecks=Object.create(null);
+let aiModelTests=Object.create(null);
 function aiKeyStatusText(check){
  if(!check)return 'לא נבדק';
  const labels={
@@ -1565,10 +1721,56 @@ async function loadAIModels(id){
   const r=await api('/api/ai_keys/models',{id});
   if(r.error)throw Error(r.error);
   aiModelCatalog[id]=r.models;
+  delete aiModelTests[id];
   renderAIKeyList();
   msg.textContent=`Google מציג ${r.models.length} מודלים שתומכים ביצירת תוכן עבור ${r.name}. `+
    'הרשימה אינה מבטיחה שהמודל יענה כרגע; שגיאת 503 בדרך כלל מציינת עומס זמני.';
  }catch(e){msg.textContent='טעינת רשימת המודלים נכשלה: '+e.message;}
+}
+const aiModelTestLabels={
+ working:'✅ יצירה הצליחה',
+ quota:'⚠️ מכסה/קצב',
+ overloaded:'⏳ עומס זמני',
+ unavailable:'❌ המודל אינו זמין',
+ unsupported:'⚠️ הבקשה אינה נתמכת',
+ access_denied:'❌ אין הרשאה',
+ unreachable:'⚠️ אין חיבור',
+ no_response:'⚠️ לא התקבל טקסט',
+ service_error:'⚠️ שגיאת שירות'
+};
+function recommendedAIModel(id){
+ const results=aiModelTests[id]?.results||{};
+ const working=Object.values(results).filter(result=>result.status==='working');
+ const priority=['gemini-3.1-flash-lite','gemini-3.1-flash-lite-preview',
+  'gemini-3.5-flash-lite','gemini-flash-lite-latest','gemini-3.5-flash',
+  'gemini-3.6-flash','gemini-3.7-flash','gemini-3-flash-preview'];
+ for(const model of priority){const result=working.find(item=>item.id===model);if(result)return result;}
+ return working[0]||null;
+}
+async function testAIModels(id){
+ const models=aiModelCatalog[id]||[],msg=document.getElementById('aiKeyMsg');
+ if(!models.length){msg.textContent='תחילה טען את רשימת המודלים למפתח הזה.';return;}
+ if(!await appConfirm(`תישלח בקשת יצירה קצרה לכל אחד מ-${models.length} המודלים ברשימה. `+
+  'הבדיקה פונה ל-Google בפועל ועשויה לצרוך מכסה. להמשיך?'))return;
+ const state=aiModelTests[id]={results:Object.create(null),running:true,completed:0,total:models.length};
+ renderAIKeyList();
+ for(const model of models){
+  try{
+   const r=await api('/api/ai_keys/test_model',{id,model:model.id});
+   if(r.error)throw Error(r.error);
+   state.results[model.id]=r.result;
+  }catch(e){
+   state.results[model.id]={id:model.id,status:'service_error',detail:e.message};
+  }
+  state.completed++;
+  renderAIKeyList();
+ }
+ state.running=false;
+ renderAIKeyList();
+ const recommendation=recommendedAIModel(id);
+ msg.textContent=recommendation
+  ? `הבדיקה הסתיימה. מומלץ כרגע: ${recommendation.id}. אפשר לבחור בו מהרשימה.`
+  : 'הבדיקה הסתיימה; אף מודל לא החזיר תשובת טקסט תקינה. בדוק את הסיבות לכל מודל.';
 }
 async function saveAIKeyModel(id,model){
  const msg=document.getElementById('aiKeyMsg');
@@ -1599,11 +1801,15 @@ async function checkAllAIKeys(){
 function renderAIKeyList(){
  const list=document.getElementById('aiKeyList');
  list.replaceChildren();
+ renderAIKeySelector();
  const keys=aiKeyList;
  if(!keys.length){list.textContent='לא נשמרו מפתחות עדיין.';return;}
  for(const key of keys){
   const row=document.createElement('div');row.style.cssText='margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap';
-  const name=document.createElement('b');name.textContent=key.name;
+  const name=document.createElement('input');name.type='text';name.maxLength=60;
+  name.value=key.name;name.title='שם המפתח השמור';name.style.width='150px';
+  const rename=document.createElement('button');rename.className='mini';
+  rename.textContent='שמור שם';rename.onclick=()=>renameAIKey(key.id,name.value);
   const status=document.createElement('span');status.textContent=aiKeyStatusText(aiKeyChecks[key.id]);
   status.title=aiKeyChecks[key.id]?aiKeyChecks[key.id].detail:'';
   const modelSelect=document.createElement('select');
@@ -1619,7 +1825,9 @@ function renderAIKeyList(){
    if(model.id===key.model)continue;
    const option=document.createElement('option');
    option.value=model.id;
-   option.textContent=`${model.display_name} — ${model.id}`;
+   const tested=aiModelTests[key.id]?.results?.[model.id];
+   option.textContent=`${model.display_name} — ${model.id}`+
+    (tested?` · ${aiModelTestLabels[tested.status]||tested.status}`:'');
    option.title=model.description||'';
    modelSelect.appendChild(option);
   }
@@ -1634,10 +1842,51 @@ function renderAIKeyList(){
   const refreshModels=document.createElement('button');refreshModels.className='mini';
   refreshModels.textContent='טען מודלים';
   refreshModels.onclick=()=>loadAIModels(key.id);
+  const testModels=document.createElement('button');testModels.className='mini';
+  testModels.textContent=aiModelTests[key.id]?.running?'בודק מודלים...':'בדוק מודלים בפועל';
+  testModels.disabled=!models.length||!!aiModelTests[key.id]?.running;
+  testModels.onclick=()=>testAIModels(key.id);
   const remove=document.createElement('button');remove.className='mini';remove.textContent='הסר';
   remove.onclick=()=>removeAIKey(key.id);
-  row.append(name,modelSelect,refreshModels,status,test,remove);list.appendChild(row);
+  row.append(name,rename,modelSelect,refreshModels,testModels,status,test,remove);list.appendChild(row);
+  const testState=aiModelTests[key.id];
+  if(testState){
+   const results=document.createElement('div');
+   results.style.cssText='margin:4px 0 10px 24px;padding:8px 12px;background:#f6f8fc;border-radius:8px';
+   if(testState.running){
+    const progress=document.createElement('div');progress.className='muted';
+    progress.textContent=`בודק מודלים: ${testState.completed} מתוך ${testState.total} הושלמו.`;
+    results.appendChild(progress);
+   }
+   for(const model of models){
+    const tested=testState.results[model.id];if(!tested)continue;
+    const line=document.createElement('div');line.className='muted';
+    line.textContent=`${model.display_name} (${model.id}) — `+
+     `${aiModelTestLabels[tested.status]||tested.status}: ${tested.detail}`;
+    results.appendChild(line);
+   }
+   const recommendation=recommendedAIModel(key.id);
+   if(recommendation){
+    const rec=document.createElement('div');rec.style.cssText='margin-top:6px;font-weight:600;color:#145c42';
+    rec.textContent=`מומלץ כרגע: ${recommendation.id} — הבדיקה הצליחה.`;
+    const choose=document.createElement('button');choose.className='mini';
+    choose.textContent='בחר מודל מומלץ';choose.onclick=()=>saveAIKeyModel(key.id,recommendation.id);
+    results.append(rec,choose);
+   }else if(!testState.running&&testState.completed){
+    const none=document.createElement('div');none.className='muted';
+    none.textContent='לא נמצא מודל שהחזיר תשובת טקסט תקינה בבדיקה.';
+    results.appendChild(none);
+   }
+   list.appendChild(results);
+  }
  }
+}
+function renderAIKeySelector(){
+ const select=document.getElementById('aiKeyChoice');if(!select)return;
+ const selected=select.value;
+ select.replaceChildren(new Option('בחירה אוטומטית',''));
+ for(const key of aiKeyList)select.appendChild(new Option(key.name,key.id));
+ select.value=aiKeyList.some(key=>key.id===selected)?selected:'';
 }
 let aiKeyList=[];
 let aiModelCatalog=Object.create(null);
@@ -1647,6 +1896,7 @@ async function loadAIKeys(){try{const r=await api('/api/ai_keys');
  const currentIds=new Set(aiKeyList.map(key=>key.id));
  for(const id of Object.keys(aiKeyChecks))if(!currentIds.has(id))delete aiKeyChecks[id];
  for(const id of Object.keys(aiModelCatalog))if(!currentIds.has(id))delete aiModelCatalog[id];
+ for(const id of Object.keys(aiModelTests))if(!currentIds.has(id))delete aiModelTests[id];
  renderAIKeyList();
  }catch(e){document.getElementById('aiKeyMsg').textContent='שגיאה בטעינת המפתחות: '+e.message;}}
 async function addAIKey(){const name=document.getElementById('aiKeyName').value.trim();
@@ -1658,6 +1908,13 @@ async function addAIKey(){const name=document.getElementById('aiKeyName').value.
  msg.textContent='המפתח נשמר בהצפנה במחשב. לחץ על „בדוק חיבור” כדי לבדוק אותו מול Google.';
  await loadAIKeys();
  }catch(e){msg.textContent='לא ניתן לשמור את המפתח: '+e.message;}}
+async function renameAIKey(id,name){
+ const msg=document.getElementById('aiKeyMsg');
+ try{const r=await api('/api/ai_keys/rename',{id:id,name:name.trim()});
+ if(r.error)throw Error(r.error);
+ msg.textContent='שם המפתח עודכן ונשמר לנתוני התוכנה.';
+ await loadAIKeys();
+ }catch(e){msg.textContent='לא ניתן לשנות את שם המפתח: '+e.message;}}
 async function removeAIKey(id){if(!await appConfirm('להסיר את מפתח ה-API הזה?'))return;
  try{const r=await api('/api/ai_keys/remove',{id:id});
  if(r.error)throw Error(r.error);
@@ -1838,10 +2095,11 @@ async function refreshQuar(){const w=document.getElementById('writer').value;
   div.appendChild(row);requestAnimationFrame(()=>autoGrow(inp));}}
 
 /* ---------- אימון ---------- */
-async function train(scope){const w=document.getElementById('writer').value;
+async function train(scope,resume){const w=document.getElementById('writer').value;
  scope=scope||document.getElementById('trainScope').value;
  if(scope!=='general'&&!w){await appAlert('בחר כותב');return;}
- const r=await api('/api/train',{writer:w,scope:scope});
+ if(resume===false&&!await appConfirm('Start a fresh run from the base/general model? The interrupted checkpoint will be kept as a backup.'))return;
+ const r=await api('/api/train',{writer:w,scope:scope,resume:resume!==false});
  if(!r.ok)await appAlert(r.msg,'האימון לא התחיל');else document.getElementById('trainIdle').textContent=r.msg;}
 async function importGeneral(){const b64=await readFile('generalFile');
  if(!b64)return;
@@ -1919,7 +2177,58 @@ async function refreshAll(keep){const ws=await api('/api/writers');
   tbl.appendChild(tr);}
  const ts=await api('/api/templates/list');const tsel=document.getElementById('tmplName');
  tsel.innerHTML='';for(const t of ts){const o=document.createElement('option');o.value=t;o.textContent=t;tsel.appendChild(o);}
- refreshQuar();loadFixStats();}
+ refreshQuar();loadFixStats();refreshExamples();}
+
+let examplesOffset=0,examplesLimit=20,examplesWriter='';
+async function refreshExamples(){
+ const writer=document.getElementById('writer').value;
+ const list=document.getElementById('examplesList');
+ const summary=document.getElementById('examplesSummary');
+ if(!writer){list.textContent='';summary.textContent='בחר כותב כדי להציג את דוגמאות האימון';return;}
+ if(writer!==examplesWriter){examplesWriter=writer;examplesOffset=0;}
+ const page=await api('/api/examples?writer='+encodeURIComponent(writer)+
+  '&offset='+examplesOffset+'&limit='+examplesLimit);
+ if(page.error){summary.textContent=page.error;return;}
+ if(page.total>0&&examplesOffset>=page.total){
+  examplesOffset=Math.floor((page.total-1)/examplesLimit)*examplesLimit;
+  return refreshExamples();
+ }
+ if(page.total===0)examplesOffset=0;
+ list.replaceChildren();
+ summary.textContent=page.total+' דוגמאות שמורות';
+ const pageNo=Math.floor(examplesOffset/examplesLimit)+1;
+ const pageCount=Math.max(1,Math.ceil(page.total/examplesLimit));
+ document.getElementById('examplesPage').textContent='עמוד '+pageNo+' מתוך '+pageCount;
+ document.getElementById('examplesPrev').disabled=examplesOffset<=0;
+ document.getElementById('examplesNext').disabled=examplesOffset+examplesLimit>=page.total;
+ for(const item of page.items){
+  const row=document.createElement('div');row.className='line';
+  const image=document.createElement('img');image.src='data:image/png;base64,'+item.img;
+  image.alt='דוגמת אימון '+item.file;image.onclick=()=>image.classList.toggle('zoom');
+  const text=document.createElement('textarea');text.className='lt';text.rows=2;
+  text.value=item.text;text.setAttribute('aria-label','תיוג דוגמת '+item.file);
+  const filename=document.createElement('span');filename.className='muted';
+  filename.textContent=item.file;
+  const save=document.createElement('button');save.className='btn';save.textContent='שמור עריכה';
+  save.onclick=async()=>{
+   const result=await api('/api/examples/edit',{writer,file:item.file,text:text.value});
+   if(!result.ok){await appAlert(result.msg||result.error||'העריכה נכשלה');return;}
+   summary.textContent=result.msg;refreshAll(writer);
+  };
+  const remove=document.createElement('button');remove.className='btn red';remove.textContent='מחק דוגמה';
+  remove.onclick=async()=>{
+   if(!await appConfirm('להסיר לצמיתות את דוגמת האימון "'+item.file+'"?'))return;
+   const result=await api('/api/examples/delete',{writer,file:item.file});
+   if(!result.ok){await appAlert(result.msg||result.error||'המחיקה נכשלה');return;}
+   summary.textContent=result.msg;refreshAll(writer);
+  };
+  row.append(image,text,filename,save,remove);list.appendChild(row);
+ }
+}
+function pageExamples(direction){
+ examplesOffset=Math.max(0,examplesOffset+direction*examplesLimit);
+ refreshExamples();
+}
 async function addWriter(){const n=document.getElementById('newWriter').value.trim();if(!n)return;
  await api('/api/writers',{name:n});document.getElementById('newWriter').value='';refreshAll(n);}
 async function deleteWriter(){const w=document.getElementById('writer').value;
@@ -1970,7 +2279,7 @@ async function importModel(){const n=document.getElementById('modelName').value.
  const r=await api('/api/import_model',{file:b64,name:n});
  document.getElementById('modelMsg').textContent=r.msg;refreshAll();}
 refreshAll();pollTrain();
-loadAIKeys();
+loadAIKeys();loadAISettings();
 </script></body></html>"""
 
 
@@ -2011,10 +2320,29 @@ class Handler(BaseHTTPRequestHandler):
                 self._bytes(f.read(), "image/x-icon")
         elif self.path == "/api/writers":
             self._json(list_writers())
+        elif urlparse(self.path).path == "/api/examples":
+            try:
+                q = parse_qs(urlparse(self.path).query)
+                writer = records.validate_writer(q.get("writer", [""])[0])
+                page = records.list_examples(
+                    writer, q.get("offset", [0])[0], q.get("limit", [20])[0])
+                items = []
+                for item in page["items"]:
+                    with Image.open(item["image_path"]) as image:
+                        image = image.convert("L")
+                        image.thumbnail((420, 120))
+                        items.append({"file": item["file"], "text": item["text"],
+                                      "img": img_to_b64(image)})
+                page["items"] = items
+                self._json(page)
+            except (ValueError, OSError) as exc:
+                self._json({"error": str(exc)}, 400)
         elif self.path == "/api/train_status":
             self._json(train_status())
         elif self.path == "/api/ai_keys":
             self._json({"keys": ai_correction.list_keys()})
+        elif self.path == "/api/ai_settings":
+            self._json(ai_correction.get_settings())
         elif self.path == "/api/templates/list":
             self._json(list_templates())
         elif self.path == "/api/config":
@@ -2104,6 +2432,28 @@ class Handler(BaseHTTPRequestHandler):
                 postfix.refresh_vocab()
                 self._json({"saved": saved, "quarantined": quar, "dups": dups})
 
+            elif self.path == "/api/examples/edit":
+                if training_running():
+                    self._json({"ok": False,
+                                "msg": "אי אפשר לערוך דוגמאות בזמן אימון פעיל"}, 409)
+                    return
+                result = records.edit_example(
+                    body["writer"], body["file"], body["text"])
+                postfix.refresh_vocab()
+                self._json({"ok": True, "result": result,
+                            "msg": "הדוגמה עודכנה. עדכון המשקולות דורש אימון מחדש."})
+
+            elif self.path == "/api/examples/delete":
+                if training_running():
+                    self._json({"ok": False,
+                                "msg": "אי אפשר למחוק דוגמאות בזמן אימון פעיל"}, 409)
+                    return
+                result = records.delete_example(body["writer"], body["file"])
+                postfix.refresh_vocab()
+                self._json({"ok": True, "result": result,
+                            "msg": "הדוגמה הוסרה מנתוני האימון. המשקולות שכבר אומנו "
+                                   "אינן משתנות עד אימון מחדש או שחזור מודל."})
+
             elif self.path == "/api/ai_keys/add":
                 keys = ai_correction.add_key(body.get("name"), body.get("key"))
                 self._json({"ok": True, "keys": keys})
@@ -2111,6 +2461,11 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/ai_keys/remove":
                 keys = ai_correction.remove_key(body.get("id", ""))
                 self._json({"ok": True, "keys": keys})
+
+            elif self.path == "/api/ai_keys/rename":
+                key = ai_correction.rename_key(
+                    body.get("id", ""), body.get("name", ""))
+                self._json({"ok": True, "key": key})
 
             elif self.path == "/api/ai_keys/check":
                 key_id = body.get("id")
@@ -2123,14 +2478,31 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(ai_correction.list_available_models(
                     body.get("id", "")))
 
+            elif self.path == "/api/ai_keys/test_model":
+                self._json({"result": ai_correction.test_model(
+                    body.get("id", ""), body.get("model", ""))})
+
             elif self.path == "/api/ai_keys/model":
                 key = ai_correction.set_key_model(
                     body.get("id", ""), body.get("model", ""))
                 self._json({"ok": True, "key": key})
 
+            elif self.path == "/api/ai_settings":
+                settings = ai_correction.save_settings(body)
+                self._json({"ok": True, "settings": settings})
+
+            elif self.path == "/api/ai_settings/reset":
+                self._json({"ok": True,
+                            "settings": ai_correction.reset_settings()})
+
             elif self.path == "/api/ai_correct":
                 self._json(ai_correction.correct_lines(
-                    body.get("lines"), body.get("batch_size", ai_correction.BATCH_SIZE)))
+                    body.get("lines"), batch_size=body.get("batch_size"),
+                    key_id=body.get("key_id"), key_name=body.get("key_name"),
+                    temperature=body.get("temperature"),
+                    top_p=body.get("top_p"), top_k=body.get("top_k"),
+                    max_output_tokens=body.get("max_output_tokens"),
+                    request_timeout=body.get("request_timeout")))
 
             elif self.path == "/api/save_fixes":
                 # מודל התיקונים: הפקת זוגות (שגוי->נכון) מהעריכות של המשתמש
@@ -2216,7 +2588,8 @@ class Handler(BaseHTTPRequestHandler):
 
             elif self.path == "/api/train":
                 ok, msg = start_training(body.get("writer") or "",
-                                         body.get("scope", "both"))
+                                         body.get("scope", "both"),
+                                         bool(body.get("resume", True)))
                 self._json({"ok": ok, "msg": msg})
 
             elif self.path == "/api/import_general":

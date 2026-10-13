@@ -15,15 +15,31 @@ from ctypes import wintypes
 
 from paths import DATA_DIR
 
-# Default only for newly added keys and legacy key records without a saved model.
+# Default for newly added keys and legacy key records without a saved model.
 # AI requests use each key's saved model selection.
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.1-flash-lite"
+LEGACY_DEFAULT_MODEL = "gemini-2.5-flash"
 BATCH_SIZE = 8
-ALLOWED_BATCH_SIZES = (1, 2, 4, 8)
+MIN_BATCH_SIZE = 1
+MAX_BATCH_SIZE = 16
 REQUEST_TIMEOUT = 90
+MAX_REQUEST_TIMEOUT = 300
 CONNECTION_CHECK_TIMEOUT = 15
+MODEL_TEST_TIMEOUT = 25
 MODEL_LIST_PAGE_SIZE = 1000
+DEFAULT_SETTINGS = {
+    "batch_size": BATCH_SIZE,
+    "temperature": 0.0,
+    "top_p": None,
+    "top_k": None,
+    "max_output_tokens": None,
+    "request_timeout": REQUEST_TIMEOUT,
+}
+SETTING_FIELDS = frozenset(DEFAULT_SETTINGS)
 MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
+AUDIO_MODEL_RE = re.compile(
+    r"(?:^|[-_.])(audio|tts|transcribe|transcription|speech|lyria)(?:[-_.]|$)",
+    re.IGNORECASE)
 _lock = threading.RLock()
 _next_key = 0
 
@@ -32,12 +48,96 @@ class AIStudioError(RuntimeError):
     pass
 
 
+KEYRING_SERVICE = "KtavYadAI Google AI Studio"
+
+
 class _DataBlob(Structure):
     _fields_ = [("cbData", wintypes.DWORD), ("pbData", POINTER(c_ubyte))]
 
 
 def _keys_path():
     return os.path.join(DATA_DIR, "ai_studio_keys.json")
+
+
+def _settings_path():
+    return os.path.join(DATA_DIR, "ai_studio_settings.json")
+
+
+def _validate_settings(settings):
+    if not isinstance(settings, dict):
+        raise AIStudioError("הגדרות תיקון AI חייבות להיות אובייקט")
+    unknown = set(settings) - SETTING_FIELDS
+    if unknown:
+        raise AIStudioError(
+            "הגדרות תיקון AI לא מוכרות: " + ", ".join(sorted(unknown)))
+    merged = {**DEFAULT_SETTINGS, **settings}
+
+    batch_size = merged["batch_size"]
+    if (not isinstance(batch_size, int) or isinstance(batch_size, bool)
+            or not MIN_BATCH_SIZE <= batch_size <= MAX_BATCH_SIZE):
+        raise AIStudioError(
+            f"גודל אצווה חייב להיות מספר שלם בין {MIN_BATCH_SIZE} ל-{MAX_BATCH_SIZE}")
+    temperature = merged["temperature"]
+    if (not isinstance(temperature, (int, float))
+            or isinstance(temperature, bool) or not 0 <= temperature <= 2):
+        raise AIStudioError("temperature חייב להיות בין 0 ל-2")
+    for name, upper in (("top_p", 1),):
+        value = merged[name]
+        if value is not None and (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool) or not 0 <= value <= upper):
+            raise AIStudioError(f"{name} חייב להיות בין 0 ל-{upper}")
+    for name, lower, upper in (
+            ("top_k", 1, 1000),
+            ("max_output_tokens", 1, 65536),
+            ("request_timeout", 1, MAX_REQUEST_TIMEOUT)):
+        value = merged[name]
+        if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool)
+                or not lower <= value <= upper):
+            raise AIStudioError(
+                f"{name} חייב להיות מספר שלם בין {lower} ל-{upper}")
+    return merged
+
+
+def get_settings():
+    path = _settings_path()
+    try:
+        with open(path, encoding="utf-8") as stream:
+            stored = json.load(stream)
+    except FileNotFoundError:
+        return dict(DEFAULT_SETTINGS)
+    except (OSError, ValueError) as exc:
+        raise AIStudioError(f"לא ניתן לקרוא את הגדרות תיקון AI: {exc}") from exc
+    return _validate_settings(stored)
+
+
+def save_settings(settings):
+    if not isinstance(settings, dict) or not settings:
+        raise AIStudioError("יש לציין לפחות הגדרה אחת לעדכון")
+    merged = _validate_settings({**get_settings(), **settings})
+    path = _settings_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = path + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump(merged, stream, ensure_ascii=False, indent=1)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+    return merged
+
+
+def reset_settings():
+    path = _settings_path()
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise AIStudioError(f"לא ניתן לאפס את הגדרות תיקון AI: {exc}") from exc
+    return dict(DEFAULT_SETTINGS)
 
 
 def _crypt(data, protect):
@@ -83,13 +183,21 @@ def _read_keys():
         raise AIStudioError(f"לא ניתן לקרוא את קובץ מפתחות AI Studio: {exc}") from exc
     if not isinstance(store, dict) or not isinstance(store.get("keys"), list):
         raise AIStudioError("קובץ מפתחות AI Studio פגום; יש לבדוק את תיקיית data")
+    migrated = False
     for item in store["keys"]:
         if (not isinstance(item, dict)
                 or not all(isinstance(item.get(field), str)
-                           for field in ("id", "name", "encrypted"))
+                           for field in ("id", "name"))
+                or not (isinstance(item.get("encrypted"), str)
+                        or isinstance(item.get("secret_ref"), str))
                 or ("model" in item and not isinstance(item["model"], str))):
             raise AIStudioError("רשומת מפתח AI Studio פגומה; יש לבדוק את תיקיית data")
-        item.setdefault("model", DEFAULT_MODEL)
+        if (item.get("model") in (None, LEGACY_DEFAULT_MODEL)
+                or AUDIO_MODEL_RE.search(item["model"])):
+            item["model"] = DEFAULT_MODEL
+            migrated = True
+    if migrated:
+        _write_keys(store["keys"])
     return store["keys"]
 
 
@@ -113,6 +221,24 @@ def list_keys():
                 for item in _read_keys()]
 
 
+def rename_key(key_id, name):
+    name = (name or "").strip()
+    if not name or len(name) > 60:
+        raise AIStudioError("יש לתת למפתח שם באורך 1–60 תווים")
+    with _lock:
+        keys = _read_keys()
+        item = next((key for key in keys if key["id"] == key_id), None)
+        if item is None:
+            raise AIStudioError("מפתח ה-API לא נמצא")
+        if any(key["id"] != key_id and
+               key["name"].casefold() == name.casefold() for key in keys):
+            raise AIStudioError("כבר קיים מפתח בשם הזה")
+        item["name"] = name
+        _write_keys(keys)
+        return {"id": item["id"], "name": item["name"],
+                "model": item["model"]}
+
+
 def add_key(name, api_key):
     name = (name or "").strip()
     api_key = (api_key or "").strip()
@@ -124,10 +250,39 @@ def add_key(name, api_key):
         keys = _read_keys()
         if any(item["name"].casefold() == name.casefold() for item in keys):
             raise AIStudioError("כבר קיים מפתח בשם הזה")
-        encrypted = base64.b64encode(_crypt(api_key.encode("utf-8"), True)).decode("ascii")
-        keys.append({"id": uuid.uuid4().hex, "name": name,
-                     "encrypted": encrypted, "model": DEFAULT_MODEL})
-        _write_keys(keys)
+        key_id = uuid.uuid4().hex
+        if os.name == "nt":
+            encrypted = base64.b64encode(
+                _crypt(api_key.encode("utf-8"), True)).decode("ascii")
+            item = {"id": key_id, "name": name, "encrypted": encrypted}
+        else:
+            try:
+                import keyring
+                keyring.set_password(KEYRING_SERVICE, key_id, api_key)
+                if keyring.get_password(KEYRING_SERVICE, key_id) != api_key:
+                    raise AIStudioError(
+                        "מנהל הסודות של מערכת ההפעלה לא אישר שמירה בטוחה")
+            except AIStudioError:
+                raise
+            except Exception as exc:
+                raise AIStudioError(
+                    "לא ניתן לשמור מפתח בצורה מאובטחת במנהל הסודות של מערכת "
+                    f"ההפעלה: {exc}") from exc
+            item = {"id": key_id, "name": name, "secret_ref": key_id}
+        item["model"] = DEFAULT_MODEL
+        keys.append(item)
+        try:
+            _write_keys(keys)
+        except OSError as write_error:
+            if os.name != "nt":
+                try:
+                    import keyring
+                    keyring.delete_password(KEYRING_SERVICE, key_id)
+                except Exception as cleanup_error:
+                    raise AIStudioError(
+                        "שמירת המפתח נכשלה, וגם לא ניתן לנקות את הערך הזמני "
+                        f"ממנהל הסודות: {cleanup_error}") from write_error
+            raise
         return [{"id": item["id"], "name": item["name"],
                  "model": item["model"]} for item in keys]
 
@@ -138,14 +293,23 @@ def remove_key(key_id):
         updated = [item for item in keys if item.get("id") != key_id]
         if len(updated) == len(keys):
             raise AIStudioError("מפתח ה-API לא נמצא")
+        removed = next(item for item in keys if item.get("id") == key_id)
         _write_keys(updated)
+        if os.name != "nt" and removed.get("secret_ref"):
+            try:
+                import keyring
+                keyring.delete_password(KEYRING_SERVICE, removed["secret_ref"])
+            except Exception as exc:
+                raise AIStudioError(
+                    f"המפתח הוסר מהרשימה אך לא ניתן למחוק אותו ממנהל הסודות: {exc}") from exc
         return [{"id": item["id"], "name": item["name"],
                  "model": item["model"]} for item in updated]
 
 
 def set_key_model(key_id, model):
     model = (model or "").strip()
-    if not MODEL_NAME_RE.fullmatch(model):
+    if (not MODEL_NAME_RE.fullmatch(model)
+            or AUDIO_MODEL_RE.search(model)):
         raise AIStudioError("שם מודל אינו תקין")
     with _lock:
         keys = _read_keys()
@@ -159,11 +323,20 @@ def set_key_model(key_id, model):
 
 def _decrypt_key(item):
     try:
+        if item.get("secret_ref"):
+            import keyring
+            secret = keyring.get_password(KEYRING_SERVICE, item["secret_ref"])
+            if not secret:
+                raise AIStudioError(
+                    f"מפתח '{item['name']}' חסר במנהל הסודות של מערכת ההפעלה")
+            return secret
         return _crypt(base64.b64decode(item["encrypted"]), False).decode("utf-8")
+    except AIStudioError:
+        raise
     except (ValueError, OSError) as exc:
         raise AIStudioError(
             f"לא ניתן לפענח את מפתח '{item['name']}'. "
-            "המפתח מוגן לחשבון Windows שבו נשמר.") from exc
+            "יש לבדוק את מנהל הסודות ואת חשבון מערכת ההפעלה.") from exc
 
 
 def _error_payload(exc):
@@ -242,6 +415,8 @@ def _list_models(api_key):
             model_id = full_name[len("models/"):]
             if not MODEL_NAME_RE.fullmatch(model_id):
                 continue
+            if AUDIO_MODEL_RE.search(model_id):
+                continue
             models.append({
                 "id": model_id,
                 "display_name": item.get("displayName") or model_id,
@@ -269,6 +444,83 @@ def list_available_models(key_id):
         "name": item["name"],
         "selected_model": item["model"],
         "models": _list_models(_decrypt_key(item)),
+    }
+
+
+def test_model(key_id, model_id):
+    model_id = (model_id or "").strip()
+    if not MODEL_NAME_RE.fullmatch(model_id) or AUDIO_MODEL_RE.search(model_id):
+        raise AIStudioError("מודל הבדיקה אינו תקין או שאינו מודל טקסט")
+    with _lock:
+        item = next((key for key in _read_keys() if key["id"] == key_id), None)
+    if item is None:
+        raise AIStudioError("מפתח ה-API לא נמצא")
+
+    api_key = _decrypt_key(item)
+    payload = {
+        "contents": [{
+            "role": "user",
+            "parts": [{"text": "Reply with the single word OK."}],
+        }],
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 8},
+    }
+    request = urllib.request.Request(
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model_id}:generateContent",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "x-goog-api-key": api_key},
+        method="POST")
+    started = time.perf_counter()
+    try:
+        with urllib.request.urlopen(request, timeout=MODEL_TEST_TIMEOUT) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        category, message = _error_payload(exc)
+        if exc.code == 400:
+            category = "unsupported"
+        elif exc.code == 401 or exc.code == 403:
+            category = "access_denied"
+        elif exc.code == 404:
+            category = "unavailable"
+        elif exc.code == 503:
+            category = "overloaded"
+        return {
+            "id": model_id,
+            "status": category,
+            "detail": message.replace(api_key, "[מפתח מוסתר]"),
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+        }
+    except urllib.error.URLError as exc:
+        return {
+            "id": model_id,
+            "status": "unreachable",
+            "detail": f"לא ניתן להתחבר ל-Google: {exc.reason}",
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+        }
+    except (OSError, TimeoutError, ValueError, UnicodeDecodeError) as exc:
+        return {
+            "id": model_id,
+            "status": "service_error",
+            "detail": f"תשובת Google אינה תקינה: {exc}",
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+        }
+
+    text = ""
+    try:
+        candidates = result["candidates"]
+        parts = candidates[0]["content"]["parts"]
+        text = "".join(part.get("text", "") for part in parts
+                       if isinstance(part, dict))
+    except (KeyError, IndexError, TypeError):
+        pass
+    status = "working" if text.strip() else "no_response"
+    return {
+        "id": model_id,
+        "status": status,
+        "detail": (f"המודל החזיר: {text.strip()}" if text.strip()
+                   else "Google קיבל את הבקשה אך לא החזיר טקסט."),
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
     }
 
 
@@ -379,12 +631,20 @@ def _translate_google_error(message, status, error_text=""):
     return message
 
 
-def _request_gemini(api_key, lines, model=DEFAULT_MODEL):
+def _request_gemini(api_key, lines, model=DEFAULT_MODEL, *, temperature=0.0,
+                    top_p=None, top_k=None, max_output_tokens=None,
+                    request_timeout=REQUEST_TIMEOUT):
     parts = [{
         "text": (
             "תקן תמלול OCR בעברית על פי התמונות המצורפות. לכל תמונה מצורפים "
             "מספר שורה והטקסט שזוהה כרגע. החזר את הטקסט המדויק שרואים בתמונה; "
-            "אל תשלים תוכן חסר ואל תנחש מילים שאינן קריאות. שמור על סדר, "
+            "קרא עברית מימין לשמאל. סדר המילים והשדות בתשובה חייב להתאים "
+            "לסדר החזותי בתמונה, מימין לשמאל; אל תהפוך את סדר השדות לפי "
+            "ניסוח שנראה טבעי יותר. שמור כל תווית צמודה לקו או לערך שמופיע "
+            "לידה, ואל תחליף ביניהם. לדוגמה, אם מופיע מימין לשמאל "
+            "'תפקיד: ____' ואז 'שם מורשה חתימה: ____', החזר "
+            "'תפקיד: ____ שם מורשה חתימה: ____' ולא את הסדר ההפוך. "
+            "אל תשלים תוכן חסר ואל תנחש מילים שאינן קריאות. שמור על "
             "מספרים, סימני פיסוק, מקפים, סוגריים, קווים תחתונים ושדות ריקים. "
             "אם התמלול הנוכחי נכון או שהתמונה אינה מאפשרת תיקון בטוח, החזר "
             "אותו ללא שינוי. החזר JSON בלבד במבנה "
@@ -392,34 +652,43 @@ def _request_gemini(api_key, lines, model=DEFAULT_MODEL):
         )
     }]
     for index, item in enumerate(lines):
-        parts.append({"text": f"שורה {index}; תמלול נוכחי: {item['text']}"})
+        line_number = item.get("line_number", item.get("number", index + 1))
+        parts.append({
+            "text": f"שורה {line_number}; תמלול נוכחי: {item['text']}"})
         parts.append({"inline_data": {
             "mime_type": "image/png",
             "data": item["img"],
         }})
-    payload = {
-        "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {
-            "temperature": 0,
-            "responseMimeType": "application/json",
-            "responseSchema": {
-                "type": "OBJECT",
-                "properties": {
-                    "corrections": {
-                        "type": "ARRAY",
-                        "items": {
-                            "type": "OBJECT",
-                            "properties": {
-                                "index": {"type": "INTEGER"},
-                                "text": {"type": "STRING"},
-                            },
-                            "required": ["index", "text"],
+    generation_config = {
+        "temperature": temperature,
+        "responseMimeType": "application/json",
+        "responseSchema": {
+            "type": "OBJECT",
+            "properties": {
+                "corrections": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "index": {"type": "INTEGER"},
+                            "text": {"type": "STRING"},
                         },
+                        "required": ["index", "text"],
                     },
                 },
-                "required": ["corrections"],
             },
+            "required": ["corrections"],
         },
+    }
+    if top_p is not None:
+        generation_config["topP"] = top_p
+    if top_k is not None:
+        generation_config["topK"] = top_k
+    if max_output_tokens is not None:
+        generation_config["maxOutputTokens"] = max_output_tokens
+    payload = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": generation_config,
     }
     request_data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
@@ -431,7 +700,7 @@ def _request_gemini(api_key, lines, model=DEFAULT_MODEL):
         method="POST")
     try:
         started = time.perf_counter()
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+        with urllib.request.urlopen(request, timeout=request_timeout) as response:
             result = json.loads(response.read().decode("utf-8"))
         elapsed = time.perf_counter() - started
     except urllib.error.HTTPError as exc:
@@ -477,21 +746,37 @@ def _request_gemini(api_key, lines, model=DEFAULT_MODEL):
     }
 
 
-def _correct_batch(lines):
+def _correct_batch(lines, generation, key_id=None, key_name=None):
     global _next_key
+    if key_id and key_name:
+        raise AIStudioError("בחר מפתח לפי מזהה או לפי שם, לא את שניהם")
     with _lock:
         keys = list(_read_keys())
         if not keys:
             raise AIStudioError("יש להוסיף מפתח Google AI Studio בהגדרות AI")
-        start = _next_key % len(keys)
-        _next_key = (start + 1) % len(keys)
+        if key_id:
+            keys = [item for item in keys if item["id"] == key_id]
+            if not keys:
+                raise AIStudioError("מפתח ה-API שנבחר לא נמצא")
+        elif key_name:
+            keys = [item for item in keys
+                    if item["name"].casefold() == key_name.casefold()]
+            if not keys:
+                raise AIStudioError(f'לא נמצא מפתח API בשם "{key_name}"')
+        else:
+            start = _next_key % len(keys)
+            keys = keys[start:] + keys[:start]
+            _next_key = (start + 1) % len(keys)
     failures = []
-    for offset in range(len(keys)):
-        item = keys[(start + offset) % len(keys)]
+    for item in keys:
         try:
             key = _decrypt_key(item)
             model = item["model"]
-            corrections, usage = _request_gemini(key, lines, model)
+            corrections, usage = _request_gemini(
+                key, lines, model, temperature=generation["temperature"],
+                top_p=generation["top_p"], top_k=generation["top_k"],
+                max_output_tokens=generation["max_output_tokens"],
+                request_timeout=generation["request_timeout"])
             return item["name"], model, corrections, usage
         except _RotateKey as exc:
             failures.append(f"{item['name']}: {exc}")
@@ -506,12 +791,27 @@ def _correct_batch(lines):
         "הסיבות שדווחו: " + " | ".join(failures))
 
 
-def correct_lines(lines, batch_size=BATCH_SIZE):
+def correct_lines(lines, batch_size=None, *, key_id=None, key_name=None,
+                  temperature=None, top_p=None, top_k=None,
+                  max_output_tokens=None, request_timeout=None):
     if not isinstance(lines, list) or not lines:
         raise AIStudioError("אין שורות לשליחה לתיקון AI")
-    if (not isinstance(batch_size, int) or isinstance(batch_size, bool)
-            or batch_size not in ALLOWED_BATCH_SIZES):
-        raise AIStudioError("גודל בקשה לא תקין; יש לבחור 1, 2, 4 או 8 שורות")
+    overrides = {
+        name: value for name, value in {
+            "batch_size": batch_size,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "max_output_tokens": max_output_tokens,
+            "request_timeout": request_timeout,
+        }.items() if value is not None
+    }
+    generation = _validate_settings({**get_settings(), **overrides})
+    batch_size = generation["batch_size"]
+    if key_id is not None and not isinstance(key_id, str):
+        raise AIStudioError("מזהה מפתח ה-API אינו תקין")
+    if key_name is not None and not isinstance(key_name, str):
+        raise AIStudioError("שם מפתח ה-API אינו תקין")
     corrections = []
     used_keys = []
     used_models = []
@@ -530,7 +830,8 @@ def correct_lines(lines, batch_size=BATCH_SIZE):
     for offset in range(0, len(lines), batch_size):
         batch = lines[offset:offset + batch_size]
         try:
-            key_name, model, parsed, usage = _correct_batch(batch)
+            used_key, model, parsed, usage = _correct_batch(
+                batch, generation, key_id=key_id, key_name=key_name)
         except AIStudioError as exc:
             if not batches:
                 raise
@@ -538,11 +839,11 @@ def correct_lines(lines, batch_size=BATCH_SIZE):
                 f"עיבוד חלקי: הושלמו {offset} מתוך {len(lines)} שורות. "
                 f"הבקשה הבאה נכשלה: {exc}")
             break
-        if key_name not in used_keys:
-            used_keys.append(key_name)
-        if not any(used["key"] == key_name and used["model"] == model
+        if used_key not in used_keys:
+            used_keys.append(used_key)
+        if not any(used["key"] == used_key and used["model"] == model
                    for used in used_models):
-            used_models.append({"key": key_name, "model": model})
+            used_models.append({"key": used_key, "model": model})
         batches.append({
             "line_count": len(batch),
             "model": model,
@@ -572,6 +873,13 @@ def correct_lines(lines, batch_size=BATCH_SIZE):
             "requested_line_count": len(lines),
             "complete": warning is None,
             "batch_size": batch_size,
+            "generation": {
+                "temperature": generation["temperature"],
+                "top_p": generation["top_p"],
+                "top_k": generation["top_k"],
+                "max_output_tokens": generation["max_output_tokens"],
+                "request_timeout": generation["request_timeout"],
+            },
             "batch_count": len(batches),
             "elapsed_seconds": round(time.perf_counter() - started, 3),
             "batches": batches,
