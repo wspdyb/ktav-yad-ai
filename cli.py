@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 VERSION = "1.0.1"
@@ -327,14 +328,15 @@ def command_train(args):
     elif args.action == "start":
         writer = (_writer(args.writer) if args.scope != "general"
                   else args.writer or "")
-        ok, message = _start_training(app, writer, args.scope, not args.fresh)
+        ok, message = _start_training(
+            app, writer, args.scope, not args.fresh, args.steps, args.batch)
         if not ok:
             raise CLIError(message)
         _output({"started": True, "message": message} if args.json else message,
                 args.json)
 
 
-def _start_training(app, writer, scope, resume):
+def _start_training(app, writer, scope, resume, steps=None, batch_size=None):
     if app.training_running():
         return False, "אימון כבר רץ"
     if scope not in ("both", "personal", "general"):
@@ -353,6 +355,8 @@ def _start_training(app, writer, scope, resume):
     flag = "--resume" if resume else "--fresh"
     if getattr(sys, "frozen", False):
         command = [sys.executable, "__train_child__", scope, writer or "-", flag]
+        if steps is not None or batch_size is not None:
+            command.extend([str(steps or 2000), str(batch_size or 24)])
         creationflags = (subprocess.DETACHED_PROCESS |
                          subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0
         kwargs = {"creationflags": creationflags} if os.name == "nt" else {
@@ -364,6 +368,10 @@ def _start_training(app, writer, scope, resume):
         command = [sys.executable, train_script, mode]
         if mode in ("chain", "writer"):
             command.append(writer)
+        if steps is not None:
+            command.extend(["--steps", str(steps)])
+        if batch_size is not None:
+            command.extend(["--batch", str(batch_size)])
         command.append(flag)
         kwargs = ({"creationflags": subprocess.DETACHED_PROCESS |
                    subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
@@ -801,20 +809,227 @@ def command_parallel(args):
     _output(result, args.json or not args.save)
 
 
+def _read_training_text(args):
+    if args.text is not None:
+        text = args.text
+    elif args.text_file:
+        path = Path(args.text_file).expanduser()
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise CLIError(f"לא ניתן לקרוא את קובץ הטקסט: {exc}", 4) from exc
+    elif sys.stdin.isatty():
+        print("הקלד שורה אחת לכל שורה בתמונה; שורה ריקה מסיימת את הקלט:")
+        lines = []
+        while True:
+            try:
+                line = input()
+            except EOFError:
+                break
+            if not line.strip():
+                break
+            lines.append(line)
+        text = "\n".join(lines)
+    else:
+        raise CLIError(
+            "יש להעביר --text או --text-file, או להפעיל ממסוף אינטראקטיבי", 2)
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _normalize_match_text(text):
+    return unicodedata.normalize("NFC", " ".join(text.split())).strip()
+
+
+def _edit_distance(left, right):
+    if len(left) < len(right):
+        left, right = right, left
+    previous = list(range(len(right) + 1))
+    for row, left_char in enumerate(left, 1):
+        current = [row]
+        for column, right_char in enumerate(right, 1):
+            current.append(min(
+                previous[column] + 1,
+                current[column - 1] + 1,
+                previous[column - 1] + (left_char != right_char)))
+        previous = current
+    return previous[-1]
+
+
+def _measure_page_accuracy(image_path, writer, expected_lines):
+    output = StringIO()
+    args = argparse.Namespace(
+        include_images=False, format="json", input=str(image_path), page=True,
+        writer=writer, model="personal", no_fix=True, progress=False,
+        timeout=0, output=None)
+    with redirect_stdout(output):
+        command_ocr(args)
+    try:
+        payload = json.loads(output.getvalue())
+        predicted_lines = [item["text"] for item in payload["lines"]]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise CLIError(f"לא ניתן לחשב דיוק מתוצאת OCR: {exc}") from exc
+    expected = "\n".join(_normalize_match_text(line)
+                         for line in expected_lines)
+    predicted = "\n".join(_normalize_match_text(line)
+                          for line in predicted_lines)
+    errors = _edit_distance(predicted, expected)
+    accuracy = max(0.0, 100.0 * (1.0 - errors / max(1, len(expected))))
+    return accuracy, predicted_lines
+
+
+def _wait_for_training(app, deadline, round_number, current_accuracy,
+                       max_hours):
+    stop_requested = False
+    interrupted = False
+    try:
+        while app.training_running():
+            now = time.monotonic()
+            if now >= deadline and not stop_requested:
+                stop_requested = app.stop_training()
+                if not stop_requested and app.training_running():
+                    raise CLIError(
+                        "הזמן הסתיים אך לא ניתן לעצור את האימון בצורה מסודרת")
+                if stop_requested:
+                    print("הזמן הוקצב; נשלחה בקשת עצירה ושמירת checkpoint.",
+                          file=sys.stderr, flush=True)
+            status = app.train_status()
+            step, total = status.get("step", 0), status.get("total", 0)
+            step_percent = 100.0 * step / total if total else 0.0
+            elapsed_percent = min(
+                100.0, 100.0 * (max_hours * 3600 - max(0, deadline - now))
+                / (max_hours * 3600))
+            print(
+                f"מחזור {round_number} | אימון {step_percent:.1f}% "
+                f"({step}/{total}) | זמן כולל {elapsed_percent:.1f}% "
+                f"| דיוק OCR אחרון {current_accuracy:.2f}%",
+                file=sys.stderr, flush=True)
+            time.sleep(2)
+    except KeyboardInterrupt:
+        interrupted = True
+        stop_requested = app.stop_training()
+        if not stop_requested and app.training_running():
+            raise CLIError("לא ניתן לעצור את האימון בצורה מסודרת")
+        print(
+            "נשלחה בקשת עצירה מסודרת; שומר checkpoint..."
+            if stop_requested else "האימון כבר הסתיים.",
+            file=sys.stderr, flush=True)
+        while app.training_running():
+            time.sleep(0.5)
+    return stop_requested, interrupted
+
+
+def command_train_until(args):
+    app = _app()
+    writer = app.records.validate_writer(_writer(args.writer))
+    image_path = Path(args.image).expanduser().resolve()
+    if not image_path.is_file():
+        raise CLIError(f"קובץ התמונה לא נמצא: {image_path}", 4)
+    if app.training_running():
+        raise CLIError(
+            "כבר פועל אימון אחר. עצור אותו או המתן שיסתיים לפני הפקודה הזו.")
+    if not 0 < args.accuracy <= 100:
+        raise CLIError("--accuracy חייב להיות גדול מ-0 ועד 100", 2)
+    if not 0 < args.max_hours <= 400:
+        raise CLIError("--max-hours חייב להיות גדול מ-0 ועד 400", 2)
+    if not 100 <= args.steps <= 10000:
+        raise CLIError("--steps חייב להיות בין 100 ל-10000", 2)
+    if not 1 <= args.batch <= 32:
+        raise CLIError("--batch חייב להיות בין 1 ל-32", 2)
+
+    texts = _read_training_text(args)
+    if not texts:
+        raise CLIError("לא הוזן טקסט לאימון", 2)
+    from PIL import Image
+    import tempfile
+    with Image.open(image_path) as image:
+        page_image = image.convert("L")
+    with tempfile.TemporaryDirectory() as directory:
+        page_path = os.path.join(directory, "training-page.png")
+        page_image.save(page_path)
+        crops = app.segment_page(page_path)
+    if len(crops) != len(texts):
+        raise CLIError(
+            f"זוהו {len(crops)} שורות בתמונה אך הוזנו {len(texts)} שורות טקסט. "
+            "תקן את שורות הטקסט או את הסריקה; לא נשמרו דוגמאות.")
+
+    samples = [{"img": app.img_to_b64(crop), "text": text}
+               for crop, text in zip(crops, texts)]
+    saved, quarantined, duplicates = app.save_lines(writer, samples)
+    app.postfix.refresh_vocab()
+    if quarantined or saved + duplicates != len(samples):
+        raise CLIError(
+            f"הדוגמאות לא כולן אושרו: נשמרו {saved}, כפילויות {duplicates}, "
+            f"בהסגר {quarantined}. בדוק את ההסגר לפני אימון.")
+
+    accuracy, _ = _measure_page_accuracy(image_path, writer, texts)
+    print(
+        f"דיוק התחלתי: {accuracy:.2f}% | יעד: {args.accuracy:.2f}% "
+        f"| דוגמאות חדשות: {saved} | כפילויות: {duplicates}",
+        file=sys.stderr, flush=True)
+    deadline = time.monotonic() + args.max_hours * 3600
+    round_number = 0
+    interrupted = False
+    while accuracy < args.accuracy and time.monotonic() < deadline:
+        round_number += 1
+        resume = round_number == 1
+        ok, message = _start_training(
+            app, writer, "personal", resume,
+            steps=args.steps, batch_size=args.batch)
+        if not ok:
+            raise CLIError(message)
+        print(
+            f"מתחיל מחזור {round_number}; checkpoint "
+            f"{'ימשיך אם קיים' if resume else 'יתחיל מסבב נוסף'}; "
+            f"דיוק נוכחי {accuracy:.2f}%, יעד {args.accuracy:.2f}%",
+            file=sys.stderr, flush=True)
+        stopped, interrupted = _wait_for_training(
+            app, deadline, round_number, accuracy, args.max_hours)
+        accuracy, _ = _measure_page_accuracy(image_path, writer, texts)
+        print(
+            f"סיום מחזור {round_number}: דיוק OCR {accuracy:.2f}% "
+            f"(יעד {args.accuracy:.2f}%)",
+            file=sys.stderr, flush=True)
+        if accuracy >= args.accuracy or interrupted:
+            break
+        if stopped or time.monotonic() >= deadline:
+            break
+
+    result = {
+        "writer": writer,
+        "image": str(image_path),
+        "target_accuracy": args.accuracy,
+        "accuracy": round(accuracy, 2),
+        "rounds": round_number,
+        "saved_examples": saved,
+        "duplicate_examples": duplicates,
+        "reached_target": accuracy >= args.accuracy,
+        "interrupted": interrupted,
+    }
+    _output(result, args.json)
+    if interrupted:
+        raise CLIError("האימון הופסק לבקשת המשתמש; אפשר להפעיל שוב ולהמשיך.", 130)
+    if accuracy < args.accuracy:
+        raise CLIError(
+            f"הזמן הסתיים לפני הגעה ליעד. הדיוק האחרון: {accuracy:.2f}%; "
+            "אפשר להריץ שוב עם אותו כותב כדי להמשיך.")
+
+
 def _internal_train(argv):
-    if len(argv) != 5:
+    if len(argv) not in (5, 7):
         raise CLIError("פרמטרים לא תקינים למשימת אימון פנימית")
-    _, scope, writer, run_flag = argv[1:]
+    _, scope, writer, run_flag, *options = argv[1:]
+    steps = int(options[0]) if options else 2000
+    batch_size = int(options[1]) if options else 24
     import train
     train._write_pid()
     resume = run_flag == "--resume"
     try:
         if scope == "both":
-            train.chain(writer, resume=resume)
+            train.chain(writer, steps, steps, resume=resume)
         elif scope == "personal":
-            train.train(writer, 2000, 24, 1e-4, resume=resume)
+            train.train(writer, steps, batch_size, 1e-4, resume=resume)
         elif scope == "general":
-            train.train("__general__", 2000, 24, 1e-4, resume=resume)
+            train.train("__general__", steps, batch_size, 1e-4, resume=resume)
         else:
             raise CLIError("היקף אימון פנימי אינו תקין")
         return 0
@@ -891,7 +1106,26 @@ def build_parser():
     sp = p.add_subparsers(dest="action", required=True)
     q = sp.add_parser("status"); _add_json_flag(q); q.set_defaults(handler=command_train)
     q = sp.add_parser("stop"); _add_json_flag(q); q.set_defaults(handler=command_train)
-    q = sp.add_parser("start"); q.add_argument("--writer"); q.add_argument("--scope", choices=("both", "personal", "general"), default="both"); q.add_argument("--fresh", action="store_true", help="התחלה מחדש במקום המשך"); _add_json_flag(q); q.set_defaults(handler=command_train)
+    q = sp.add_parser("start"); q.add_argument("--writer"); q.add_argument("--scope", choices=("both", "personal", "general"), default="both"); q.add_argument("--steps", type=int); q.add_argument("--batch", type=int); q.add_argument("--fresh", action="store_true", help="התחלה מחדש במקום המשך"); _add_json_flag(q); q.set_defaults(handler=command_train)
+
+    p = sub.add_parser(
+        "learn",
+        help="שמור תמלול של תמונה ואמן כותב עד לדיוק OCR שתבחר")
+    p.add_argument("image", help="נתיב לתמונה של עמוד כתב היד")
+    p.add_argument("--writer", help="שם הכותב; אם הושמט תתבקש לבחור/להקליד")
+    text_source = p.add_mutually_exclusive_group()
+    text_source.add_argument("--text", help="התמלול; שורות מופרדות בירידת שורה")
+    text_source.add_argument("--text-file", help="קובץ UTF-8, שורה לכל שורה בתמונה")
+    p.add_argument("--accuracy", type=float, required=True,
+                   help="סף דיוק תווים בתמלול ה-OCR (1–100 אחוז)")
+    p.add_argument("--max-hours", type=float, default=3,
+                   help="משך מרבי (עד 400 שעות; ברירת מחדל 3)")
+    p.add_argument("--steps", type=int, default=500,
+                   help="צעדי אימון בכל מחזור (ברירת מחדל 500)")
+    p.add_argument("--batch", type=int, default=2,
+                   help="גודל אצוות אימון (ברירת מחדל 2)")
+    _add_json_flag(p)
+    p.set_defaults(handler=command_train_until)
 
     p = sub.add_parser("fixes", help="צפייה, עריכה והסרה של תיקוני מילון שנלמדו")
     sp = p.add_subparsers(dest="action", required=True)

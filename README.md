@@ -62,6 +62,7 @@ OCRHE examples delete --writer "אישי" --file "gui_123.png" --yes
 OCRHE quarantine list --writer "אישי" --json
 OCRHE train start --writer "אישי" --scope both
 OCRHE train status --json
+OCRHE learn "D:\scans\page.png" --writer "שמואל" --accuracy 95
 OCRHE models evaluate --name typed --json
 OCRHE writers purge-data --name "אישי" --yes
 OCRHE fixes list --writer "אישי" --json
@@ -86,6 +87,20 @@ first, then explicitly use `examples add` or `parallel --save` if it is correct.
 Use `--data-dir` to point a command at an isolated copy of `data` and `models`
 when testing mutations. `models evaluate` reports character error rate without
 changing model weights or creating a persistent validation split.
+
+`OCRHE learn <image>` is the guided image-to-training workflow: provide the
+approved transcript with `--text-file` (UTF-8, one line per handwritten line),
+`--text`, or the interactive prompt, select a writer, and set the character
+accuracy threshold with `--accuracy`. The command checks that detected image
+lines match transcript lines, saves examples through the normal safety gates,
+and trains only that writer's personal model until whole-page OCR reaches the
+chosen threshold or `--max-hours` expires (up to 400). Progress reports the
+current training-step percentage, elapsed time-budget percentage, and latest
+whole-page character accuracy. It resumes a partial checkpoint when restarted;
+completed rounds start from the best saved personal model. Defaults are 500
+steps and batch size 2; adjust with `--steps` and `--batch`. Accuracy is
+character-level edit accuracy after Unicode and whitespace normalization, with
+line breaks preserved; it is not the model's training-set CER.
 
 For the verified five-line Samuel page, run
 `python train_samuel_until_exact.py --data-dir .\portable --max-hours 400 --steps-per-round 100 --batch-size 2`.
